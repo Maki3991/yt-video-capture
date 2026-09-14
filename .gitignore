@@ -1,0 +1,13 @@
+# Local credentials. Never commit these files.
+.env
+.env.local
+
+# Local runtime output and caches.
+__pycache__/
+*.py[cod]
+
+# Generated OSS-route test artifacts may contain transcript content.
+oss-test-results/
+
+# Local OSS cleanup reports.
+cleanup-results/

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -46,12 +47,62 @@ SENSITIVE_URL_KEYS = {
     "resolved_url",
     "direct_url",
     "file_url",
+    "file_urls",
+    "signed_url",
     "transcription_url",
+}
+LOCAL_ENV_KEYS = {
+    "OSS_ACCESS_KEY_ID",
+    "OSS_ACCESS_KEY_SECRET",
+    "OSS_ENDPOINT",
+    "OSS_BUCKET",
 }
 
 
 class YouTubeError(RuntimeError):
     """A user-facing, non-secret error from the YouTube pipeline."""
+
+
+def load_local_env() -> None:
+    """Load whitelisted values from the Skill-local .env without printing them."""
+
+    skill_root = Path(__file__).resolve().parents[1]
+    paths: list[Path] = []
+    for candidate in (
+        skill_root / ".env",
+        skill_root / ".env.local",
+        Path.cwd() / ".env",
+        Path.cwd() / ".env.local",
+    ):
+        if candidate not in paths:
+            paths.append(candidate)
+
+    values: dict[str, str] = {}
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            key = key.strip()
+            if not separator or key not in LOCAL_ENV_KEYS:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            values[key] = value
+
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
+load_local_env()
 
 
 def utc_now() -> str:
@@ -514,6 +565,132 @@ def resolve_direct_url(
     raise YouTubeError("yt-dlp 没有返回可交给百炼的媒体直链。\n" + "\n".join(diagnostics))
 
 
+def download_audio(
+    source_url: str,
+    output_dir: Path,
+    *,
+    explicit_yt_dlp: str | None = None,
+    cookies_from_browser: str | None = None,
+    format_selector: str = "bestaudio[ext=m4a]/bestaudio/best",
+) -> Path:
+    """Download one audio track locally for the OSS delivery route."""
+
+    source_url = validate_video_url(source_url)
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    template = str(output_dir / "source.%(ext)s")
+    completed = _run_yt_dlp(
+        [
+            "--no-playlist",
+            "--newline",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "--socket-timeout",
+            "30",
+            "-f",
+            format_selector,
+            "-o",
+            template,
+            source_url,
+        ],
+        explicit_yt_dlp,
+        cookies_from_browser,
+    )
+    if completed.returncode != 0:
+        diagnostic = (completed.stderr or completed.stdout or "").strip()
+        raise YouTubeError(
+            "yt-dlp 无法下载本地音频。\n"
+            + safe_error(diagnostic[-2500:] or f"return code {completed.returncode}", source_url)
+        )
+
+    candidates = [
+        path
+        for path in output_dir.glob("source.*")
+        if path.is_file() and path.suffix.lower() not in {".part", ".ytdl"}
+    ]
+    if not candidates:
+        raise YouTubeError(f"yt-dlp 下载完成但没有找到音频文件：{output_dir}")
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _oss_settings() -> tuple[str, str, str, str]:
+    access_key_id = os.environ.get("OSS_ACCESS_KEY_ID", "").strip()
+    access_key_secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "").strip()
+    endpoint = os.environ.get("OSS_ENDPOINT", "").strip()
+    bucket_name = os.environ.get("OSS_BUCKET", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("OSS_ACCESS_KEY_ID", access_key_id),
+            ("OSS_ACCESS_KEY_SECRET", access_key_secret),
+            ("OSS_ENDPOINT", endpoint),
+            ("OSS_BUCKET", bucket_name),
+        )
+        if not value
+    ]
+    if missing:
+        raise YouTubeError(
+            "OSS 配置不完整，缺少："
+            + ", ".join(missing)
+            + "。请在 Skill 目录的 .env 中填写，或在当前进程设置同名环境变量。"
+        )
+    return access_key_id, access_key_secret, endpoint, bucket_name
+
+
+def upload_local_media_to_oss(
+    media_path: Path,
+    object_key: str,
+    *,
+    signed_url_expires: int = 3600,
+) -> dict[str, Any]:
+    """Upload a local media file to private OSS and return a short-lived GET URL."""
+
+    media_path = media_path.expanduser().resolve()
+    if not media_path.is_file():
+        raise YouTubeError(f"找不到待上传的本地媒体文件：{media_path}")
+    if signed_url_expires <= 0:
+        raise YouTubeError("OSS 签名 URL 有效期必须是正整数秒数。")
+
+    try:
+        import oss2
+    except ImportError as exc:
+        raise YouTubeError(
+            "当前 Python 环境没有安装 oss2。请先执行：python -m pip install oss2"
+        ) from exc
+
+    access_key_id, access_key_secret, endpoint, bucket_name = _oss_settings()
+    object_key = object_key.strip().lstrip("/")
+    if not object_key:
+        raise YouTubeError("OSS object key 不能为空。")
+
+    auth = oss2.Auth(access_key_id, access_key_secret)
+    bucket = oss2.Bucket(auth, endpoint, bucket_name)
+    content_type = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
+    result = bucket.put_object_from_file(
+        object_key,
+        str(media_path),
+        headers={"Content-Type": content_type},
+    )
+    response_status = getattr(result, "status", None)
+    if response_status not in (None, 200):
+        raise YouTubeError(f"OSS 上传失败，HTTP 状态：{response_status}")
+
+    metadata = bucket.head_object(object_key)
+    signed_url = bucket.sign_url("GET", object_key, signed_url_expires)
+    return {
+        "bucket": bucket_name,
+        "object_key": object_key,
+        "local_path": str(media_path),
+        "size_bytes": int(getattr(metadata, "content_length", media_path.stat().st_size)),
+        "content_type": content_type,
+        "signed_url": signed_url,
+        "signed_url_expires": signed_url_expires,
+        "uploaded_at": utc_now(),
+    }
+
+
 def _api_json(
     method: str,
     uri: str,
@@ -678,12 +855,17 @@ def transcribe_media(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     language_hints: Iterable[str] | None = None,
     diarization: bool = False,
+    media_path: Path | None = None,
+    oss_object_key: str | None = None,
+    oss_url_expires: int = 3600,
 ) -> dict[str, Any]:
-    """Resolve, submit, poll and save one ASR result."""
+    """Deliver one media file to Bailian, poll the ASR task and save its result."""
 
     source_url = validate_video_url(source_url)
     if poll_interval <= 0 or timeout <= 0:
         raise YouTubeError("轮询间隔和超时时间必须是正整数。")
+    if media_path is not None and oss_url_expires <= 0:
+        raise YouTubeError("OSS 签名 URL 有效期必须是正整数秒数。")
     api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
     if not api_key:
         raise YouTubeError(
@@ -694,12 +876,14 @@ def transcribe_media(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     api_base_url = api_base_url.rstrip("/")
     model = str(model).strip() or DEFAULT_MODEL
+    delivery = "oss-signed-url" if media_path is not None else "youtube-cdn"
     request_info = {
         "schema_version": 1,
         "status": "running",
         "model": model,
         "source_url": source_url,
         "api_base_url": api_base_url,
+        "delivery": delivery,
         "submitted_at": utc_now(),
     }
     write_json(artifact_dir / "request-info.json", request_info)
@@ -707,25 +891,54 @@ def transcribe_media(
     direct_url = ""
     task_id = ""
     try:
-        direct_url, yt_dlp_description = resolve_direct_url(
-            source_url,
-            explicit_yt_dlp,
-            cookies_from_browser,
-        )
-        write_json(
-            artifact_dir / "resolution.json",
-            {
-                "schema_version": 1,
-                "status": "resolved",
-                "source_url": source_url,
-                "resolved_url": direct_url,
-                "resolved_host": urlparse(direct_url).netloc,
-                "yt_dlp": yt_dlp_description,
-                "auth_mode": "cookies-from-browser" if cookies_from_browser else "none",
-                "resolved_at": utc_now(),
-            },
-            sanitize=True,
-        )
+        oss_info: dict[str, Any] | None = None
+        if media_path is not None:
+            local_path = Path(media_path).expanduser().resolve()
+            default_key = (
+                f"youtube-asr/{safe_component(video_id_from_url(source_url), fallback='video')}"
+                f"{local_path.suffix.lower() or '.bin'}"
+            )
+            oss_info = upload_local_media_to_oss(
+                local_path,
+                oss_object_key or default_key,
+                signed_url_expires=oss_url_expires,
+            )
+            direct_url = str(oss_info["signed_url"])
+            write_json(
+                artifact_dir / "oss.json",
+                {
+                    "schema_version": 1,
+                    "status": "uploaded",
+                    "bucket": oss_info["bucket"],
+                    "object_key": oss_info["object_key"],
+                    "local_path": oss_info["local_path"],
+                    "size_bytes": oss_info["size_bytes"],
+                    "content_type": oss_info["content_type"],
+                    "signed_url_expires": oss_info["signed_url_expires"],
+                    "uploaded_at": oss_info["uploaded_at"],
+                },
+                sanitize=True,
+            )
+        else:
+            direct_url, yt_dlp_description = resolve_direct_url(
+                source_url,
+                explicit_yt_dlp,
+                cookies_from_browser,
+            )
+            write_json(
+                artifact_dir / "resolution.json",
+                {
+                    "schema_version": 1,
+                    "status": "resolved",
+                    "source_url": source_url,
+                    "resolved_url": direct_url,
+                    "resolved_host": urlparse(direct_url).netloc,
+                    "yt_dlp": yt_dlp_description,
+                    "auth_mode": "cookies-from-browser" if cookies_from_browser else "none",
+                    "resolved_at": utc_now(),
+                },
+                sanitize=True,
+            )
 
         parameters: dict[str, Any] = {"channel_id": [0]}
         hints = [str(item).strip() for item in (language_hints or []) if str(item).strip()]
@@ -785,7 +998,9 @@ def transcribe_media(
             {
                 "status": "completed",
                 "task_id": task_id,
+                "delivery": delivery,
                 "resolved_host": urlparse(direct_url).netloc,
+                "oss_object_key": oss_info["object_key"] if oss_info else None,
                 "completed_at": utc_now(),
             }
         )
@@ -794,7 +1009,9 @@ def transcribe_media(
             "status": "completed",
             "model": model,
             "task_id": task_id,
+            "delivery": delivery,
             "resolved_host": urlparse(direct_url).netloc,
+            "oss_object_key": oss_info["object_key"] if oss_info else None,
             "transcript_path": str(transcript_path),
             "transcription": transcription,
             "result": sanitize_for_persist(result_item),
@@ -843,6 +1060,7 @@ def write_video_note(
     scope: str,
     status: str,
     transcript_source: str,
+    media_delivery: str | None = None,
     transcript: dict[str, Any] | None = None,
     asr_model: str | None = None,
     task_id: str | None = None,
@@ -867,6 +1085,7 @@ def write_video_note(
         f"captured_at: {_frontmatter_value(utc_now())}",
         f"scope: {_frontmatter_value(scope)}",
         f"transcript_source: {_frontmatter_value(transcript_source)}",
+        f"media_delivery: {_frontmatter_value(media_delivery)}",
         f"status: {_frontmatter_value(status)}",
         f"duration_seconds: {_frontmatter_value(metadata.get('duration'))}",
         f"asr_model: {_frontmatter_value(asr_model)}",
@@ -895,11 +1114,16 @@ def write_video_note(
         )
     elif transcript is not None:
         lines.extend(["## 视频文字稿", "", *transcript_lines(transcript), ""])
+        delivery_text = (
+            "上传到私有 OSS 后生成的短时签名 URL"
+            if media_delivery == "oss-signed-url"
+            else "yt-dlp 解析出的临时媒体直链"
+        )
         lines.extend(
             [
                 "## 处理说明",
                 "",
-                "> 文字稿由 yt-dlp 解析出的临时媒体直链交给百炼异步语音识别生成。",
+                f"> 文字稿由{delivery_text}交给百炼异步语音识别生成。",
                 "> 临时签名直链未写入此 Markdown；请以原始视频链接作为来源。",
                 "",
             ]

@@ -17,10 +17,13 @@ from youtube_asr import (
     DEFAULT_TIMEOUT_SECONDS,
     YouTubeError,
     clean_video_metadata,
+    download_audio,
     get_video_metadata,
+    read_json,
     safe_component,
     transcribe_media,
     utc_now,
+    video_id_from_url,
     validate_video_url,
     write_json,
     write_video_note,
@@ -93,6 +96,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="请求说话人分离；长视频建议谨慎使用",
     )
+    parser.add_argument(
+        "--via-oss",
+        action="store_true",
+        help="先使用本地音频，再上传私有 OSS，通过短时签名 URL 交给百炼",
+    )
+    parser.add_argument(
+        "--media-file",
+        type=Path,
+        default=None,
+        help="--via-oss 时使用已有本地媒体文件；不填则先用 yt-dlp 下载音频",
+    )
+    parser.add_argument(
+        "--metadata-file",
+        type=Path,
+        default=None,
+        help="复用已有 metadata.json，跳过本次 yt-dlp 元数据请求",
+    )
+    parser.add_argument(
+        "--oss-object-key",
+        default=None,
+        help="OSS 对象路径；默认 youtube-asr/<视频ID>.<扩展名>",
+    )
+    parser.add_argument(
+        "--oss-url-expires",
+        type=int,
+        default=3600,
+        help="OSS 签名 URL 有效期秒数；默认 3600",
+    )
     return parser
 
 
@@ -101,6 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.poll_interval <= 0 or args.timeout <= 0:
         parser.error("--poll-interval 和 --timeout 必须是正整数")
+    if args.oss_url_expires <= 0:
+        parser.error("--oss-url-expires 必须是正整数")
+    if args.media_file is not None and not args.via_oss:
+        parser.error("--media-file 必须与 --via-oss 一起使用")
 
     try:
         source_url = validate_video_url(args.source)
@@ -128,12 +163,23 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output / "metadata.json", metadata, sanitize=True)
 
     try:
-        print("[youtube-video] reading video metadata with yt-dlp...", flush=True)
-        metadata = get_video_metadata(
-            source_url,
-            args.yt_dlp,
-            args.cookies_from_browser,
-        )
+        if args.metadata_file is not None:
+            metadata_path = args.metadata_file.expanduser().resolve()
+            print(f"[youtube-video] reusing metadata: {metadata_path}", flush=True)
+            metadata = read_json(metadata_path)
+            metadata_source_id = str(metadata.get("source_id") or "").strip()
+            source_id = video_id_from_url(source_url)
+            if metadata_source_id and metadata_source_id != source_id:
+                raise YouTubeError(
+                    "--metadata-file 中的 source_id 与当前 YouTube 链接不一致。"
+                )
+        else:
+            print("[youtube-video] reading video metadata with yt-dlp...", flush=True)
+            metadata = get_video_metadata(
+                source_url,
+                args.yt_dlp,
+                args.cookies_from_browser,
+            )
         write_json(output / "metadata.json", metadata, sanitize=True)
         manifest.update(
             {
@@ -145,7 +191,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_json(manifest_path, manifest, sanitize=True)
 
-        print("[youtube-video] resolving a temporary media URL and submitting ASR...", flush=True)
+        media_path: Path | None = None
+        if args.via_oss:
+            if args.media_file is not None:
+                media_path = args.media_file.expanduser().resolve()
+                print(f"[youtube-video] using local media: {media_path}", flush=True)
+            else:
+                print("[youtube-video] downloading audio locally for OSS...", flush=True)
+                media_path = download_audio(
+                    source_url,
+                    output / "video",
+                    explicit_yt_dlp=args.yt_dlp,
+                    cookies_from_browser=args.cookies_from_browser,
+                )
+                print(f"[youtube-video] downloaded media: {media_path}", flush=True)
+            delivery_message = "uploading media to private OSS and submitting ASR"
+        else:
+            delivery_message = "resolving a temporary media URL and submitting ASR"
+        print(f"[youtube-video] {delivery_message}...", flush=True)
         result = transcribe_media(
             source_url,
             output / "video",
@@ -161,6 +224,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             language_hints=_parse_language_hints(args.language_hints),
             diarization=args.diarization,
+            media_path=media_path,
+            oss_object_key=args.oss_object_key,
+            oss_url_expires=args.oss_url_expires,
         )
         write_video_note(
             note_path,
@@ -168,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             scope="single",
             status="captured",
             transcript_source="asr",
+            media_delivery=result.get("delivery"),
             transcript=result["transcription"],
             asr_model=result["model"],
             task_id=result["task_id"],
@@ -180,7 +247,9 @@ def main(argv: list[str] | None = None) -> int:
                     "status": "completed",
                     "model": result["model"],
                     "task_id": result["task_id"],
+                    "delivery": result.get("delivery"),
                     "resolved_host": result["resolved_host"],
+                    "oss_object_key": result.get("oss_object_key"),
                     "transcript_path": "video/transcript.md",
                 },
                 "completed_at": utc_now(),
