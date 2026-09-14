@@ -1,0 +1,5 @@
+interface:
+  display_name: "YouTube Video Capture"
+  short_description: "Transcribe YouTube videos and channel batches into Markdown"
+  default_prompt: "Use $yt-video-capture to transcribe this YouTube video or collect the first N public videos from this channel into traceable local Markdown; preserve metadata, raw ASR evidence, item status, and temporary-URL redaction."
+

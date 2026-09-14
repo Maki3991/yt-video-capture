@@ -1,0 +1,12 @@
+{
+  "request_id": "171badae-53cf-9dc4-88d1-880ba72677d5",
+  "output": {
+    "task_id": "75398ace-c647-4cdc-801a-4a451e245c7c",
+    "task_status": "FAILED",
+    "submit_time": "2026-09-10 15:22:33.238",
+    "scheduled_time": "2026-09-10 15:22:33.286",
+    "end_time": "2026-09-10 15:23:03.461",
+    "code": "FILE_DOWNLOAD_FAILED",
+    "message": "FILE_DOWNLOAD_FAILED"
+  }
+}
