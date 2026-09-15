@@ -68,6 +68,7 @@ YouTube 的广告可能在几秒后出现“跳过广告”，也可能没有跳
    The script uses `yt-dlp` only to download a local audio file, uploads it to the private OSS Bucket, and gives Bailian only the short-lived OSS signed URL. If a local audio file already exists, add `--media-file` to skip the download. There is no YouTube CDN direct-link fallback.
 
 4. Inspect the generated `note.md`, `manifest.json`, `metadata.json`, and `video/`. A completed note must have `YOUTUBE_STATUS=captured`, a non-empty transcript, and a successful `manifest.json`. Browser-caption output must record `retrieval_method=computer_use` and `asr_status=skipped`; ASR output must record `media_delivery=oss-signed-url` and an `oss.json` artifact.
+   `manifest.json` also records a `stages` object. Each stage is written back immediately and contains `status`, `started_at`, `completed_at`, `attempt`, `retryable`, `error`, `reason`, and `artifact_paths`; a failed or cancelled stage must remain visible even when a later fallback succeeds.
 5. Only after the single-video route is manually checked, process a small channel pilot first:
 
    ```powershell
@@ -138,9 +139,19 @@ task_id: task ID | null
 media_delivery: oss-signed-url | null
 status: running | captured | partial | failed | pending_review | cancelled
 review_status: unreviewed | sampled | needs_review
+stages:
+  <stage>:
+    status: pending | running | succeeded | skipped | failed | cancelled
+    started_at: RFC3339 | null
+    completed_at: RFC3339 | null
+    attempt: integer
+    retryable: true | false
+    error: string | null
+    artifact_paths: []
+    reason: string | null
 ```
 
-The same contract is used for single-video notes and each channel-batch item. `null` means that a field does not apply or has not been reached yet. `captured` means the transcript was produced and is non-empty; it does not mean the content has been fact-checked. A usable platform caption sets `transcript_source=platform_caption`, `asr_status=skipped`, and records its language/type. If no usable caption exists, the pipeline falls back to ASR and records `transcript_source=asr`. Automatic translated captions are not used by default.
+The same contract is used for single-video notes and each channel-batch item. `stages` is stored in the single-video `manifest.json` and in each item inside the batch `run.json`; it is not just console logging. `null` means that a field does not apply or has not been reached yet. `captured` means the transcript was produced and is non-empty; it does not mean the content has been fact-checked. A usable platform caption sets `transcript_source=platform_caption`, `asr_status=skipped`, and records its language/type. If no usable caption exists, the pipeline falls back to ASR and records `transcript_source=asr`. Automatic translated captions are not used by default.
 
 For a single video, the output directory contains:
 

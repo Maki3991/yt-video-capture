@@ -8,7 +8,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from youtube_asr import (
     DEFAULT_API_BASE_URL,
@@ -16,16 +16,20 @@ from youtube_asr import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     YouTubeError,
+    artifact_path_for_output,
     build_transcript_contract,
     caption_result_for_persist,
     clean_video_metadata,
     download_audio,
     get_video_metadata,
+    initial_stage_states,
     import_browser_transcript,
     read_json,
     safe_component,
+    safe_error,
     transcribe_media,
     utc_now,
+    update_stage_state,
     video_id_from_url,
     validate_video_url,
     write_json,
@@ -47,6 +51,75 @@ def _default_output(source_url: str) -> Path:
 
 def _base_metadata(source_url: str) -> dict[str, Any]:
     return clean_video_metadata({}, source_url)
+
+
+def _record_stage(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    output_root: Path,
+    source_url: str,
+    stage: str,
+    status: str,
+    *,
+    artifact_paths: list[str] | tuple[str, ...] = (),
+    artifact_root: Path | None = None,
+    error: str | None = None,
+    retryable: bool | None = None,
+    reason: str | None = None,
+) -> None:
+    root = artifact_root or output_root
+    paths = [
+        artifact_path_for_output(
+            path,
+            artifact_root=root,
+            output_root=output_root,
+        )
+        for path in artifact_paths
+        if str(path or "").strip()
+    ]
+    update_stage_state(
+        manifest.setdefault("stages", initial_stage_states()),
+        stage,
+        status,
+        artifact_paths=paths,
+        error=safe_error(error, source_url) if error else None,
+        retryable=retryable,
+        reason=reason,
+    )
+    write_json(manifest_path, manifest, sanitize=True)
+
+
+def _make_asr_stage_callback(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    output_root: Path,
+    source_url: str,
+    artifact_root: Path,
+) -> Callable[..., None]:
+    def callback(
+        stage: str,
+        status: str,
+        *,
+        artifact_paths: list[str] | tuple[str, ...] = (),
+        error: str | None = None,
+        retryable: bool | None = None,
+        reason: str | None = None,
+    ) -> None:
+        _record_stage(
+            manifest,
+            manifest_path,
+            output_root,
+            source_url,
+            stage,
+            status,
+            artifact_paths=tuple(artifact_paths),
+            artifact_root=artifact_root,
+            error=error,
+            retryable=retryable,
+            reason=reason,
+        )
+
+    return callback
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -203,13 +276,26 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "output_dir": str(output),
         "note_path": str(note_path),
+        "stages": initial_stage_states(),
     }
     write_json(output / "metadata.json", metadata, sanitize=True)
+    write_json(manifest_path, manifest, sanitize=True)
     caption_result: dict[str, Any] = {"status": "not_run"}
+    active_stage: str | None = None
 
     try:
         if args.browser_transcript_file is not None:
             print("[youtube-video] importing Computer Use browser transcript...", flush=True)
+            active_stage = "browser_transcript"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+                artifact_root=output / "video",
+            )
             browser_result = import_browser_transcript(
                 source_url,
                 args.browser_transcript_file,
@@ -219,11 +305,29 @@ def main(argv: list[str] | None = None) -> int:
             )
             metadata = browser_result.pop("metadata")
             caption_result = browser_result
+            active_stage = "metadata"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+            )
         elif args.browser_no_transcript:
             print(
                 "[youtube-video] Computer Use 已确认没有可用 Transcript；"
                 "跳过 yt-dlp 字幕检查，进入本地音频→OSS→百炼...",
                 flush=True,
+            )
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "browser_transcript",
+                "skipped",
+                reason="no_usable_transcript",
             )
             metadata = _base_metadata(source_url)
             if args.browser_title:
@@ -231,9 +335,36 @@ def main(argv: list[str] | None = None) -> int:
             if args.browser_author:
                 metadata["author"] = " ".join(args.browser_author.split())
             metadata["metadata_source"] = "computer_use"
+            active_stage = "metadata"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+            )
         elif args.metadata_file is not None:
             metadata_path = args.metadata_file.expanduser().resolve()
             print(f"[youtube-video] reusing metadata: {metadata_path}", flush=True)
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "browser_transcript",
+                "skipped",
+                reason="browser_check_not_supplied",
+            )
+            active_stage = "metadata"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+            )
             metadata = read_json(metadata_path)
             metadata_source_id = str(metadata.get("source_id") or "").strip()
             source_id = video_id_from_url(source_url)
@@ -243,6 +374,24 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             print("[youtube-video] reading video metadata with yt-dlp...", flush=True)
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "browser_transcript",
+                "skipped",
+                reason="browser_check_not_supplied",
+            )
+            active_stage = "metadata"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+            )
             metadata = get_video_metadata(
                 source_url,
                 args.yt_dlp,
@@ -250,6 +399,31 @@ def main(argv: list[str] | None = None) -> int:
                 args.cookies_file,
             )
         write_json(output / "metadata.json", metadata, sanitize=True)
+        _record_stage(
+            manifest,
+            manifest_path,
+            output,
+            source_url,
+            "metadata",
+            "succeeded",
+            artifact_paths=("metadata.json",),
+        )
+        if args.browser_transcript_file is not None:
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "browser_transcript",
+                "succeeded",
+                artifact_paths=(
+                    f"video/{caption_result['raw_path']}",
+                    f"video/{caption_result['transcript_path']}",
+                    f"video/{caption_result['selection_path']}",
+                ),
+                artifact_root=output,
+            )
+        active_stage = None
         manifest.update(
             {
                 "source_id": metadata.get("source_id"),
@@ -277,6 +451,16 @@ def main(argv: list[str] | None = None) -> int:
         write_json(manifest_path, manifest, sanitize=True)
         if caption_result.get("status") == "succeeded":
             caption_path = f"video/{caption_result['raw_path']}"
+            active_stage = "markdown_render"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+                artifact_root=output,
+            )
             write_video_note(
                 note_path,
                 metadata,
@@ -290,6 +474,17 @@ def main(argv: list[str] | None = None) -> int:
                 transcript_path="video/transcript.md",
                 caption_path=caption_path,
             )
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "succeeded",
+                artifact_paths=("video/transcript.md", "note.md"),
+                artifact_root=output,
+            )
+            active_stage = None
             manifest.update(
                 {
                     **build_transcript_contract(
@@ -324,9 +519,40 @@ def main(argv: list[str] | None = None) -> int:
         media_path: Path
         if args.media_file is not None:
             media_path = args.media_file.expanduser().resolve()
+            if not media_path.is_file():
+                _record_stage(
+                    manifest,
+                    manifest_path,
+                    output,
+                    source_url,
+                    "media_download",
+                    "failed",
+                    error=f"找不到待上传的本地媒体文件：{media_path}",
+                    retryable=False,
+                )
+                raise YouTubeError(f"找不到待上传的本地媒体文件：{media_path}")
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "media_download",
+                "skipped",
+                artifact_paths=(str(media_path),),
+                reason="local_media_supplied",
+            )
             print(f"[youtube-video] using local media: {media_path}", flush=True)
         else:
             print("[youtube-video] downloading audio locally for OSS...", flush=True)
+            active_stage = "media_download"
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "running",
+            )
             media_path = download_audio(
                 source_url,
                 output / "video",
@@ -334,6 +560,17 @@ def main(argv: list[str] | None = None) -> int:
                 cookies_from_browser=args.cookies_from_browser,
                 cookies_file=args.cookies_file,
             )
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                active_stage,
+                "succeeded",
+                artifact_paths=(str(media_path),),
+                artifact_root=output,
+            )
+            active_stage = None
             print(f"[youtube-video] downloaded media: {media_path}", flush=True)
         print("[youtube-video] uploading media to private OSS and submitting ASR...", flush=True)
         result = transcribe_media(
@@ -352,7 +589,15 @@ def main(argv: list[str] | None = None) -> int:
             media_path=media_path,
             oss_object_key=args.oss_object_key,
             oss_url_expires=args.oss_url_expires,
+            on_stage=_make_asr_stage_callback(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                output / "video",
+            ),
         )
+        active_stage = "markdown_render"
         write_video_note(
             note_path,
             metadata,
@@ -366,6 +611,17 @@ def main(argv: list[str] | None = None) -> int:
             task_id=result["task_id"],
             transcript_path="video/transcript.md",
         )
+        _record_stage(
+            manifest,
+            manifest_path,
+            output,
+            source_url,
+            active_stage,
+            "succeeded",
+            artifact_paths=("note.md",),
+            artifact_root=output,
+        )
+        active_stage = None
         manifest.update(
             {
                 **build_transcript_contract(
@@ -400,8 +656,32 @@ def main(argv: list[str] | None = None) -> int:
         error = "用户中断了 YouTube 转写。"
         status = "cancelled"
     except (OSError, YouTubeError) as exc:
-        error = str(exc)
+        error = safe_error(str(exc), source_url)
         status = "failed"
+
+    if active_stage:
+        _record_stage(
+            manifest,
+            manifest_path,
+            output,
+            source_url,
+            active_stage,
+            "cancelled" if status == "cancelled" else "failed",
+            error=error,
+            retryable=status == "cancelled" or active_stage != "asr_submit",
+        )
+
+    error_path = output / "video" / "error.json"
+    if not error_path.is_file():
+        write_json(
+            error_path,
+            {
+                "status": status,
+                "error": error,
+                "failed_stage": active_stage,
+                "recorded_at": utc_now(),
+            },
+        )
 
     if caption_result.get("status") in {"skipped", "failed"}:
         caption_reason = caption_result.get("reason") or "caption_unavailable"

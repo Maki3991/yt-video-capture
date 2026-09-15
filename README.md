@@ -194,9 +194,21 @@ task_id: 百炼任务 ID 或 null
 media_delivery: oss-signed-url | null
 status: running | captured | partial | failed | pending_review | cancelled
 review_status: unreviewed | sampled | needs_review
+stages:
+  <stage>:
+    status: pending | running | succeeded | skipped | failed | cancelled
+    started_at: RFC3339 | null
+    completed_at: RFC3339 | null
+    attempt: integer
+    retryable: true | false
+    error: string | null
+    artifact_paths: []
+    reason: string | null
 ```
 
-有可用平台字幕时，结果标记为 `transcript_source: platform_caption`、`asr_status: skipped`，并记录字幕语言和类型；没有可用字幕时才标记为 `transcript_source: asr`。`captured` 只表示文字稿非空且处理完成，不代表内容已经人工核验。自动翻译字幕默认不作为原始文字稿。
+有可用平台字幕时，结果标记为 `transcript_source: platform_caption`、`asr_status: skipped`，并记录字幕语言和类型；没有可用字幕时才标记为 `transcript_source: asr`。`captured` 只表示文字稿非空且处理完成，不代表内容已经人工核验。
+
+单视频的 `manifest.json` 和频道 `run.json` 中的每个条目都会保存 `stages`。阶段状态会在每次变化后立即写回，而不是只在任务结束时写日志；因此可以看到具体卡在元数据、音频下载、OSS、百炼提交、轮询、结果下载还是 Markdown 渲染。`reason` 用于记录跳过或分流原因。自动翻译字幕默认不作为原始文字稿。
 
 ## 频道前 N 条
 

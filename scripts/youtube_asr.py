@@ -26,7 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -65,6 +65,25 @@ LOCAL_ENV_KEYS = {
 OUTPUT_CONTRACT_VERSION = 1
 CAPTION_FORMAT_PREFERENCE = ("vtt", "srt", "srv3", "srv1", "ttml", "json3")
 CAPTION_TYPE_ORDER = {"manual": 0, "automatic": 1, "translated": 2}
+PIPELINE_STAGES = (
+    "metadata",
+    "browser_transcript",
+    "media_download",
+    "oss_upload",
+    "asr_submit",
+    "asr_poll",
+    "transcript_download",
+    "markdown_render",
+)
+STAGE_STATUSES = {
+    "pending",
+    "running",
+    "succeeded",
+    "skipped",
+    "failed",
+    "cancelled",
+}
+StageCallback = Callable[..., None]
 
 
 class YouTubeError(RuntimeError):
@@ -115,6 +134,127 @@ load_local_env()
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def initial_stage_states() -> dict[str, dict[str, Any]]:
+    """Return the durable per-video stage state used by manifests."""
+
+    return {
+        stage: {
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "attempt": 0,
+            "retryable": False,
+            "error": None,
+            "artifact_paths": [],
+            "reason": None,
+        }
+        for stage in PIPELINE_STAGES
+    }
+
+
+def update_stage_state(
+    stages: dict[str, Any],
+    stage: str,
+    status: str,
+    *,
+    artifact_paths: Iterable[str] | None = None,
+    error: str | None = None,
+    retryable: bool | None = None,
+    reason: str | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Update one stage without discarding evidence from earlier attempts."""
+
+    if stage not in PIPELINE_STAGES:
+        raise YouTubeError(f"未知的处理阶段：{stage}")
+    if status not in STAGE_STATUSES:
+        raise YouTubeError(f"未知的阶段状态：{status}")
+
+    previous = stages.get(stage)
+    previous = previous if isinstance(previous, dict) else {}
+    previous_status = str(previous.get("status") or "pending")
+    try:
+        previous_attempt = int(previous.get("attempt") or 0)
+    except (TypeError, ValueError):
+        previous_attempt = 0
+    timestamp = now or utc_now()
+    previous_paths = previous.get("artifact_paths")
+    previous_paths = previous_paths if isinstance(previous_paths, list) else []
+    record: dict[str, Any] = {
+        "status": status,
+        "started_at": previous.get("started_at"),
+        "completed_at": previous.get("completed_at"),
+        "attempt": max(0, previous_attempt),
+        "retryable": bool(previous.get("retryable", False)),
+        "error": previous.get("error"),
+        "artifact_paths": list(previous_paths),
+    }
+
+    if status == "pending":
+        record.update(
+            {
+                "started_at": None,
+                "completed_at": None,
+                "retryable": False if retryable is None else bool(retryable),
+                "error": None,
+                "reason": reason,
+            }
+        )
+    elif status == "running":
+        attempt = previous_attempt if previous_status == "running" else previous_attempt + 1
+        record.update(
+            {
+                "started_at": timestamp,
+                "completed_at": None,
+                "attempt": max(1, attempt),
+                "retryable": True if retryable is None else bool(retryable),
+                "error": None,
+                "reason": reason,
+            }
+        )
+    else:
+        record.update(
+            {
+                "started_at": previous.get("started_at") or timestamp,
+                "completed_at": timestamp,
+                "attempt": max(1, previous_attempt),
+                "retryable": (
+                    False if status in {"succeeded", "skipped"} else True
+                    if retryable is None
+                    else bool(retryable)
+                ),
+                "error": str(error)[:3000] if error else None,
+                "reason": reason,
+            }
+        )
+
+    for raw_path in artifact_paths or []:
+        normalized = str(raw_path or "").strip().replace("\\", "/")
+        if normalized and normalized not in record["artifact_paths"]:
+            record["artifact_paths"].append(normalized)
+    stages[stage] = record
+    return record
+
+
+def artifact_path_for_output(
+    path: Path | str,
+    *,
+    artifact_root: Path,
+    output_root: Path,
+) -> str:
+    """Represent an artifact relative to the run root without leaking host paths."""
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = artifact_root / candidate
+    candidate = candidate.resolve()
+    output_root = output_root.expanduser().resolve()
+    try:
+        return candidate.relative_to(output_root).as_posix()
+    except ValueError:
+        return f"external:{candidate.name}"
 
 
 def build_transcript_contract(
@@ -1589,6 +1729,28 @@ def _first_successful_result(task: dict[str, Any]) -> tuple[str, dict[str, Any]]
     raise YouTubeError("百炼任务成功但没有返回可下载的 transcription_url。")
 
 
+def _notify_stage(
+    callback: StageCallback | None,
+    stage: str,
+    status: str,
+    *,
+    artifact_paths: Iterable[str] = (),
+    error: str | None = None,
+    retryable: bool | None = None,
+    reason: str | None = None,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        stage,
+        status,
+        artifact_paths=list(artifact_paths),
+        error=error,
+        retryable=retryable,
+        reason=reason,
+    )
+
+
 def transcribe_media(
     source_url: str,
     artifact_dir: Path,
@@ -1602,6 +1764,7 @@ def transcribe_media(
     media_path: Path,
     oss_object_key: str | None = None,
     oss_url_expires: int = 3600,
+    on_stage: StageCallback | None = None,
 ) -> dict[str, Any]:
     """Deliver one media file to Bailian, poll the ASR task and save its result."""
 
@@ -1637,11 +1800,14 @@ def transcribe_media(
 
     signed_url = ""
     task_id = ""
+    active_stage: str | None = None
     try:
         default_key = (
             f"youtube-asr/{safe_component(video_id_from_url(source_url), fallback='video')}"
             f"{media_path.suffix.lower() or '.bin'}"
         )
+        active_stage = "oss_upload"
+        _notify_stage(on_stage, active_stage, "running")
         oss_info = upload_local_media_to_oss(
             media_path,
             oss_object_key or default_key,
@@ -1663,6 +1829,7 @@ def transcribe_media(
             },
             sanitize=True,
         )
+        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("oss.json",))
 
         parameters: dict[str, Any] = {"channel_id": [0]}
         hints = [str(item).strip() for item in (language_hints or []) if str(item).strip()]
@@ -1675,6 +1842,8 @@ def transcribe_media(
             "input": {"file_urls": [signed_url]},
             "parameters": parameters,
         }
+        active_stage = "asr_submit"
+        _notify_stage(on_stage, active_stage, "running")
         submit = _api_json(
             "POST",
             f"{api_base_url}/services/audio/asr/transcription",
@@ -1688,7 +1857,10 @@ def transcribe_media(
         task_id = str(submit_output.get("task_id") or "").strip()
         if not task_id:
             raise YouTubeError(f"提交成功响应中没有 task_id；详见 {artifact_dir / 'submit.json'}")
+        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("submit.json",))
 
+        active_stage = "asr_poll"
+        _notify_stage(on_stage, active_stage, "running")
         deadline = time.monotonic() + timeout
         task: dict[str, Any] | None = None
         last_status = ""
@@ -1711,7 +1883,10 @@ def transcribe_media(
         task_output = task_output if isinstance(task_output, dict) else {}
         if str(task_output.get("task_status") or "").upper() != "SUCCEEDED":
             raise YouTubeError(f"百炼转写失败；详见 {artifact_dir / 'task.json'}")
+        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("task.json",))
 
+        active_stage = "transcript_download"
+        _notify_stage(on_stage, active_stage, "running")
         transcription_url, result_item = _first_successful_result(task)
         transcription = _download_json(transcription_url)
         write_json(artifact_dir / "transcription.json", transcription, sanitize=True)
@@ -1719,8 +1894,19 @@ def transcribe_media(
             raise YouTubeError(
                 f"百炼任务完成但没有返回可读文字稿；详见 {artifact_dir / 'transcription.json'}"
             )
+        _notify_stage(
+            on_stage,
+            active_stage,
+            "succeeded",
+            artifact_paths=("transcription.json",),
+        )
+
+        active_stage = "markdown_render"
+        _notify_stage(on_stage, active_stage, "running")
         transcript_path = artifact_dir / "transcript.md"
         write_transcript_markdown(transcript_path, transcription, model, task_id)
+        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("transcript.md",))
+        active_stage = None
 
         request_info.update(
             {
@@ -1745,17 +1931,52 @@ def transcribe_media(
             "result": sanitize_for_persist(result_item),
         }
     except KeyboardInterrupt:
-        status = "cancelled"
         message = "用户中断了视频转写。"
-        raise YouTubeError(message) from None
+        if active_stage:
+            _notify_stage(
+                on_stage,
+                active_stage,
+                "cancelled",
+                error=message,
+                retryable=True,
+            )
+        write_json(
+            artifact_dir / "error.json",
+            {
+                "status": "cancelled",
+                "error": message,
+                "task_id": task_id or None,
+                "failed_stage": active_stage,
+                "recorded_at": utc_now(),
+            },
+        )
+        request_info.update(
+            {
+                "status": "cancelled",
+                "task_id": task_id or None,
+                "error": message,
+                "cancelled_at": utc_now(),
+            }
+        )
+        write_json(artifact_dir / "request-info.json", request_info)
+        raise
     except (OSError, subprocess.SubprocessError, YouTubeError, URLError) as exc:
         message = safe_error(str(exc), source_url, signed_url)
+        if active_stage:
+            _notify_stage(
+                on_stage,
+                active_stage,
+                "failed",
+                error=message,
+                retryable=active_stage != "asr_submit",
+            )
         write_json(
             artifact_dir / "error.json",
             {
                 "status": "failed",
                 "error": message,
                 "task_id": task_id or None,
+                "failed_stage": active_stage,
                 "recorded_at": utc_now(),
             },
         )

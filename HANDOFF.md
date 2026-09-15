@@ -44,6 +44,7 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 - 当前单视频成功输出 `note.md`、`metadata.json`、`manifest.json` 和 `video/` 证据目录。
 - 当前频道批量已经有 `source/channel.json`、`source/videos.json`、`run.json`、逐项 `items/` 和 `notes/`，并能跳过已有成功项、使用 `--run-dir` 继续。
 - 当前单视频和频道批量条目已经共享 v1 输出契约：来源、范围、字幕字段、ASR 字段、处理状态和人工复核状态；字幕成功时 `transcript_source=platform_caption`、`asr_status=skipped`。
+- P0-2 阶段状态记录已接入：单视频 `manifest.json` 和频道 `run.json` 的每个 item 都持久化 `metadata`、`browser_transcript`、`media_download`、`oss_upload`、`asr_submit`、`asr_poll`、`transcript_download`、`markdown_render` 八个阶段，以及状态、时间、attempt、retryable、错误和产物路径；ASR 内部阶段在每次变化时立即写回。
 - 当前 ASR 已保存 `request-info.json`、`oss.json`、`submit.json`、`task.json`、`transcription.json`，但重新启动时还不会根据已有 `task_id` 继续轮询。
 - 当前共享 ASR 层只接受本地媒体文件，固定使用本地音频 → 私有 OSS → 百炼链路；`--via-oss` 和 YouTube CDN 直链路径已从单视频入口移除。
 - 当前实现使用 `--ignore-config`，不读取 Chrome 配置文件；如果 PATH 中有 Node.js，会自动追加 `--js-runtimes node` 处理 YouTube JavaScript challenge。yt-dlp 路线会自动检查外部固定目录 `D:\Softwares\Programming Projects\_yt-cookies\` 中的 Cookie 文件，显式 `--cookies <path>` 优先；`--cookies-from-browser` 与 `--cookies` 仍只能选一个，后者用于 Chrome DPAPI 无法解密时的 Mozilla/Netscape Cookie 文件。
@@ -85,7 +86,7 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 - 浏览器导入成功时记录 `transcript_source=platform_caption`、`asr_status=skipped`；
 - ASR 成功时记录 `transcript_source=asr`、`media_delivery=oss-signed-url`。
 
-#### P0-2｜阶段状态与失败记录
+#### P0-2｜阶段状态与失败记录（代码已实现，Gate C 待验收）
 
 这是五个已讨论点中的第一优先级，也是后续续跑的基础。
 
@@ -123,6 +124,8 @@ artifact_paths: []
 - 单项失败不应让频道批量丢失其他已确认项；
 - 不在错误中保存 Cookie、API Key、签名媒体 URL 或签名转写结果 URL；
 - 批量层继续维护成功、失败、跳过、不支持、待处理数量。
+
+实现状态：本轮已经把八个阶段写入单视频 `manifest.json` 和频道 `run.json` 的 item，并在阶段变化后立即持久化；频道 `run.json` 同步维护各状态计数。尚未完成的是“中断后恢复原 task_id”的 P1-1，以及 Gate C 对真实中断场景的验收。
 
 ### P1：P0 通过后、频道批量前完成
 
