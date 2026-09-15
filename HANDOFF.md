@@ -2,7 +2,7 @@
 
 > 日期：2026-09-14  
 > 交给：负责继续开发 `yt-video-capture` 的 Agent  
-> 目标：在进入频道小批量采集前，完成“字幕优先、无字幕再 ASR、失败可解释、异步任务可续跑”的 YouTube 单视频与批量基础。
+> 目标：完成“浏览器字幕优先、无字幕走本地音频→OSS→百炼、失败可解释、异步任务可续跑”的 YouTube 单视频基础，并为频道批量复用。
 
 ## 0. 阅读顺序和当前边界
 
@@ -24,22 +24,29 @@
 当前 `yt-video-capture` 的单视频路径是：
 
 ```text
-YouTube URL
-  → yt-dlp 获取 metadata
-  → yt-dlp 解析临时媒体直链
+YouTube URL + 当前 Codex 可控制的登录 Chrome
+  → Computer Use 等待并跳过可见广告
+  → 有可用 Transcript：导出页面文字稿并生成 Markdown
+  → 无可用 Transcript：yt-dlp 下载本地音频
+  → 私有 OSS 短时签名 URL
   → 百炼异步 ASR
   → note.md + video/transcript.md + JSON 证据
 ```
 
 当前实现的几个事实：
 
-- 目前没有 YouTube 字幕优先分支；即使视频已有字幕，也会继续走 ASR。
-- `metadata.json` 由 yt-dlp 的 JSON 清洗而来，不包含待长期保存的签名媒体直链。
-- 默认不把完整视频下载到本地，只把 yt-dlp 解析出的临时媒体 URL 交给百炼。
+- 当前单视频脚本已经提供 `--browser-transcript-file` 浏览器导入入口：校验 Computer Use 导出的 YouTube 视频 ID，保存浏览器原始文本，生成统一 Markdown，并在 manifest 的 captions 中记录 `retrieval_method=computer_use`；该路径不调用 yt-dlp、OSS 或百炼。
+- 当前单视频脚本已经提供 `--browser-no-transcript` 分流信号：跳过 yt-dlp 字幕检查，使用 yt-dlp 下载本地音频，再强制通过私有 OSS 交给百炼。
+- 单视频不再使用 yt-dlp 提取字幕，也不再解析或提交 YouTube CDN 直链。
+- `metadata.json` 可以来自浏览器导入、浏览器提供的标题/作者，或显式复用的 metadata 文件；不保存签名媒体 URL。
+- 浏览器字幕成功时，单视频输出 `video/captions/<caption-type>.browser.txt`、`selection.json` 和规范化 `transcript.md`，不需要百炼 API Key。
+- 真实视频 `CzDTaLqozlQ` 和 `subGeHuQ_lY` 已通过 CUA 登录页面确认能导出字幕，并已导入为统一 Markdown；该路径已真实通过。
 - 当前单视频成功输出 `note.md`、`metadata.json`、`manifest.json` 和 `video/` 证据目录。
 - 当前频道批量已经有 `source/channel.json`、`source/videos.json`、`run.json`、逐项 `items/` 和 `notes/`，并能跳过已有成功项、使用 `--run-dir` 继续。
-- 当前 ASR 已保存 `request-info.json`、`resolution.json`、`submit.json`、`task.json`、`transcription.json`，但重新启动时还不会根据已有 `task_id` 继续轮询。
-- 当前实现使用 `--ignore-config`，默认不读 Cookie；只有用户显式提供 `--cookies-from-browser` 时才使用浏览器登录态。
+- 当前单视频和频道批量条目已经共享 v1 输出契约：来源、范围、字幕字段、ASR 字段、处理状态和人工复核状态；字幕成功时 `transcript_source=platform_caption`、`asr_status=skipped`。
+- 当前 ASR 已保存 `request-info.json`、`oss.json`、`submit.json`、`task.json`、`transcription.json`，但重新启动时还不会根据已有 `task_id` 继续轮询。
+- 当前共享 ASR 层只接受本地媒体文件，固定使用本地音频 → 私有 OSS → 百炼链路；`--via-oss` 和 YouTube CDN 直链路径已从单视频入口移除。
+- 当前实现使用 `--ignore-config`，默认不读 Cookie；用户可显式提供 `--cookies-from-browser` 或 `--cookies <path>`，二者只能选一个，后者用于 Chrome DPAPI 无法解密时的 Mozilla/Netscape Cookie 文件。
 
 ## 2. 总优先级
 
@@ -47,48 +54,31 @@ YouTube URL
 
 ### P0：现在必须完成
 
-#### P0-1｜字幕优先，再决定是否 ASR
+#### P0-1｜浏览器字幕优先，无字幕再走本地 OSS ASR
 
-这是新增的第一道分流，必须发生在 ASR 提交之前。
-
-目标流程：
+单视频的分流由 Skill 层的 Computer Use 完成，不再由 yt-dlp 检查字幕：
 
 ```text
-获取 metadata
-  → 检查可用字幕
-  → 有可用原始字幕：下载/保存字幕并跳过 ASR
-  → 没有可用字幕：解析媒体直链并进入 ASR
+打开用户已登录的 Chrome
+  → 等待并点击可见的“跳过广告”按钮
+  → 尝试导出 YouTube Transcript
+  → 导出成功：浏览器导入器生成 Markdown，并跳过 ASR
+  → 没有 Transcript：传入 --browser-no-transcript
+  → yt-dlp 下载本地音频
+  → 私有 OSS 短时签名 URL
+  → 百炼异步 ASR
   → 统一渲染 Markdown
 ```
 
-字幕优先级建议：
+约束：
 
-1. 用户指定语言的人工/原始字幕；
-2. 用户指定语言的自动生成字幕；
-3. 没有可用原始字幕时进入 ASR；
-4. 自动翻译字幕不默认作为原始文字稿使用。若用户明确允许，必须标记为 `translated`，不能伪装成原始字幕。
-
-实现时使用 yt-dlp 的字幕能力，例如检查可用字幕、选择语言、下载人工字幕和自动字幕。不要把字幕 URL 当作永久来源；下载后的 `.vtt`/`.srt` 原文件才是字幕证据。
-
-字幕路径的输出至少应包含：
-
-```text
-video/
-  captions/
-    <language>.<vtt|srt>       # 原始字幕文件
-  transcript.md                # 清洗后的统一文字稿
-```
-
-并在 manifest/frontmatter 中记录：
-
-```yaml
-transcript_source: platform_caption
-caption_language: en
-caption_type: manual | automatic | translated
-asr_status: skipped
-```
-
-字幕下载、解析或内容为空时，不得标记为字幕成功；可以回退到 ASR，并同时记录字幕阶段失败原因。
+- Python 单视频脚本不调用 yt-dlp 字幕能力；
+- Python 单视频脚本不把 YouTube CDN 直链交给百炼；
+- `--browser-transcript-file` 表示字幕已由 Computer Use 导出；
+- `--browser-no-transcript` 表示 Computer Use 已确认没有可用 Transcript；
+- ASR 分支必须先得到本地媒体文件，再上传私有 OSS；
+- 浏览器导入成功时记录 `transcript_source=platform_caption`、`asr_status=skipped`；
+- ASR 成功时记录 `transcript_source=asr`、`media_delivery=oss-signed-url`。
 
 #### P0-2｜阶段状态与失败记录
 
@@ -98,8 +88,9 @@ asr_status: skipped
 
 ```text
 metadata
-captions
-media_resolve
+browser_transcript
+media_download
+oss_upload
 asr_submit
 asr_poll
 transcript_download
@@ -157,7 +148,7 @@ artifact_paths: []
 
 建议沿用 `video/request-info.json`、`video/submit.json`、`video/task.json` 和 `video/transcription.json`，但让它们成为真正可恢复的 checkpoint，而不只是调试文件。
 
-本次不要求自动实现本地下载/OSS 备用链路；如果临时直链无法被百炼访问，先按阶段记录失败。备用媒体投递可以作为后续独立闸门。
+OSS 投递链路已经作为单视频 ASR 的固定路径实现；本阶段不把 OSS 清理或媒体投递续跑与 ASR 任务续跑混在一起。OSS→百炼的真实端到端成功仍需单独验收，不能用模拟测试代替。
 
 #### P1-2｜不覆盖旧批次，恢复必须显式
 
@@ -241,6 +232,7 @@ video/               字幕/ASR 原始证据及 transcript.md
 无论文字稿来自字幕还是 ASR，最终都应保留同一组基础字段：
 
 ```yaml
+contract_version: 1
 platform: youtube
 source_url: original YouTube page URL
 source_id: YouTube video ID
@@ -249,12 +241,14 @@ title: video title
 published_at: original publish time | unknown
 captured_at: local capture time
 scope: single | creator_recent_n | date_range
-transcript_source: platform_caption | asr | unavailable
+transcript_source: platform_caption | asr | unavailable | null
 caption_language: language | null
 caption_type: manual | automatic | translated | null
+asr_status: pending | skipped | completed | failed | cancelled
 asr_model: model | null
 task_id: task ID | null
-status: captured | partial | failed | pending_review | cancelled
+media_delivery: oss-signed-url | null
+status: running | captured | partial | failed | pending_review | cancelled
 review_status: unreviewed | sampled | needs_review
 ```
 
@@ -271,10 +265,17 @@ review_status: unreviewed | sampled | needs_review
 
 ### Gate A：字幕路径
 
+浏览器路线的额外验收要求：
+
+- Computer Use 从用户已登录的 Chrome 页面导出 UTF-8 文字稿；
+- 浏览器导出的原始文本保存到 video/captions/；
+- captions 中记录 retrieval_method=computer_use；
+- 该次运行不调用 yt-dlp、OSS 或百炼。
+
 用一个真实且确认有可用字幕的视频：
 
 - metadata 成功；
-- 原始 `.vtt`/`.srt` 保存；
+- 浏览器导出的原始 `.txt` 保存；
 - 生成规范化 `transcript.md` 和 `note.md`；
 - `transcript_source=platform_caption`；
 - ASR 没有提交，或 manifest 明确记录 `asr=skipped`；
@@ -284,19 +285,21 @@ review_status: unreviewed | sampled | needs_review
 
 用一个确认没有可用字幕的视频：
 
-- 字幕阶段记录 `no_usable_caption`；
-- yt-dlp 成功解析媒体直链；
+- Computer Use 记录 `no_usable_transcript`；
+- yt-dlp 成功下载本地音频；
+- `oss.json` 记录上传对象；
 - 百炼任务成功并保存 task checkpoint；
 - 生成带时间戳的 `transcript.md` 和 `note.md`；
 - `transcript_source=asr`；
-- `manifest` 中可以回溯模型、task_id 和证据路径。
+- `media_delivery=oss-signed-url`，且 `manifest` 中可以回溯模型、task_id 和证据路径；
+- 提交给百炼的输入不是 YouTube CDN 直链。
 
 ### Gate C：失败与续跑
 
 至少验证：
 
 - metadata 失败；
-- 字幕下载/解析失败后回退 ASR；
+- yt-dlp 本地音频下载失败时保留失败证据；
 - ASR 任务提交后程序中断，再运行时继续原 task；
 - 转写结果下载失败时不重新提交任务；
 - 失败项生成清晰的阶段状态和错误记录；
@@ -320,7 +323,7 @@ Gate A-C 通过后，再运行频道 5 条小批量：
 - 不把静态检查、CLI 帮助或模拟任务写成真实端到端成功；
 - 不把“有字幕”推断成字幕一定完整可用；
 - 不把 ASR 文字稿当作事实核验结果；
-- 不默认下载完整视频；媒体下载应是明确动作或后续备用链路；
+- 无 Transcript 时只下载音频到本地用于 OSS 投递；不默认保存完整视频；
 - 不读取、保存或输出 Cookie、API Key、签名媒体 URL；
 - 不为补足频道数量而搜索新视频；
 - 不在本次任务中开发跨平台总控；

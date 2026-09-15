@@ -1,60 +1,64 @@
 ---
 name: yt-video-capture
-description: Convert a specified YouTube video, or the first N public videos from a specified YouTube channel, into traceable local Markdown transcripts using yt-dlp and Bailian asynchronous ASR; safely preview and clean expired temporary OSS media. Do not use it for platform publishing, unrestricted discovery, or bypassing access controls.
+description: Capture a specified YouTube video's transcript through an authorized Computer Use browser session, or when no usable browser transcript exists download local audio with yt-dlp, upload it to private OSS, and use Bailian ASR; also process the first N public channel videos and safely clean temporary OSS media. Do not use it for platform publishing, unrestricted discovery, or bypassing access controls.
 ---
 
 # YouTube Video Capture
 
 This Skill has three entry points:
 
-- one YouTube video URL → one Markdown transcript;
+- one YouTube video URL → one Markdown transcript, using the browser-caption or local-audio→OSS→Bailian route;
 - one public YouTube channel URL + N → the first N entries from the selected public channel tab, each archived as Markdown.
 - “清空 OSS 内存” → preview and, only after confirmation, delete expired objects under `youtube-asr/`.
 
-The default media route is:
+For a single video, the Skill-level route is:
 
 ```text
 YouTube page URL
-  → yt-dlp resolves a temporary audio/video URL
-  → Bailian qwen-audio-3.0-asr-flash-filetrans asynchronous task
-  → timestamped transcript + Markdown note + JSON evidence
-```
-
-When a YouTube CDN URL cannot be fetched by Bailian, the explicit fallback route is:
-
-```text
-YouTube page URL
-  → yt-dlp local audio file
+  → Computer Use opens the user's authorized Chrome YouTube page and skips an ad when a skip button appears
+  → usable YouTube Transcript: export it and import locally
+  → no usable Transcript: yt-dlp downloads local audio
   → private OSS object + short-lived signed GET URL
   → Bailian qwen-audio-3.0-asr-flash-filetrans asynchronous task
   → timestamped transcript + Markdown note + JSON evidence
 ```
 
-It deliberately does not reuse the XHS browser extension. YouTube public video and channel pages are handled by yt-dlp; the XHS Skill keeps its existing logged-in Chrome capture path.
+The Python single-video script does not read YouTube captions with yt-dlp and does not send a YouTube CDN URL to Bailian. It receives either the browser-exported transcript or the explicit `--browser-no-transcript` signal from the Skill layer. The latter starts the local-audio→OSS→Bailian route.
+
+The browser route is read-only: it uses the user's authorized Chrome page only to obtain the visible YouTube Transcript and click a visible ad-skip control. It does not read or export Cookie, submit data to YouTube, or bypass login, CAPTCHA, age gates, or access controls. Channel batches remain yt-dlp-based for now; their ASR fallback also uses local audio→OSS→Bailian.
 
 ## Workflow
 
-1. One-time setup: ensure Python 3, `yt-dlp`, and a Bailian API key are available. Put the key only in the current process environment as `DASHSCOPE_API_KEY`. For the OSS route, install `oss2` and fill the ignored Skill-local `.env` with the RAM credentials and private Bucket settings. Do not write secrets into Markdown or JSON artifacts. The default route does not read browser cookies.
-2. For one video, run:
+1. One-time setup: ensure Python 3 and `yt-dlp` are available. A video with a usable browser Transcript does not need `DASHSCOPE_API_KEY`, `oss2`, or OSS credentials. The no-Transcript route needs `DASHSCOPE_API_KEY`, `oss2`, and the ignored Skill-local `.env` with the RAM credentials and private Bucket settings. Do not write secrets into Markdown or JSON artifacts. The default route does not read browser cookies.
+2. For one video, use the authorized Computer Use browser route as the first branch:
+
+   - select the user's already-open YouTube Chrome tab;
+   - navigate to the user-provided /watch URL if needed;
+   - if an ad is playing, wait for the visible skip control and click it; do not assume a fixed ad duration;
+   - call the browser tab's transcript export capability;
+   - if export succeeds, capture the returned UTF-8 text file path and visible page title, then run the local importer:
+
+   ~~~powershell
+   python "<skill-root>\scripts\youtube_video_to_md.py" "<youtube-video-url>" --browser-transcript-file "<computer-use-exported-txt>" --browser-title "<visible-video-title>" --out-dir ".\youtube-video-results\browser-one-video"
+   ~~~
+
+   The importer validates the exported video ID, retains the browser export under video/captions/, and never calls yt-dlp, OSS, or Bailian.
+
+3. If Computer Use confirms that the page has no usable Transcript, pass the browser result to the local script and go straight to OSS ASR:
 
    ```powershell
    python "<skill-root>\scripts\youtube_video_to_md.py" `
      "<youtube-video-url>" `
-     --out-dir ".\youtube-video-results\one-video"
+     --browser-no-transcript `
+     --browser-title "<visible-video-title>" `
+     --browser-author "<visible-channel-name>" `
+     --out-dir ".\youtube-video-results\one-video-asr"
    ```
 
-   If Bailian cannot fetch the YouTube CDN URL, use the explicit OSS route. With an existing local audio file:
+   The script uses `yt-dlp` only to download a local audio file, uploads it to the private OSS Bucket, and gives Bailian only the short-lived OSS signed URL. If a local audio file already exists, add `--media-file` to skip the download. There is no YouTube CDN direct-link fallback.
 
-   ```powershell
-   python "<skill-root>\scripts\youtube_video_to_md.py" `
-     "<youtube-video-url>" `
-     --via-oss `
-     --media-file ".\test-results\<run>\video\source.m4a" `
-     --out-dir ".\youtube-video-results\one-video-oss"
-   ```
-
-3. Inspect the generated `note.md`, `manifest.json`, `metadata.json`, and `video/`. A completed note must have `YOUTUBE_STATUS=captured`, a non-empty transcript, and a successful `manifest.json`.
-4. Only after the single-video route is manually checked, process a small channel pilot first:
+4. Inspect the generated `note.md`, `manifest.json`, `metadata.json`, and `video/`. A completed note must have `YOUTUBE_STATUS=captured`, a non-empty transcript, and a successful `manifest.json`. Browser-caption output must record `retrieval_method=computer_use` and `asr_status=skipped`; ASR output must record `media_delivery=oss-signed-url` and an `oss.json` artifact.
+5. Only after the single-video route is manually checked, process a small channel pilot first:
 
    ```powershell
    python "<skill-root>\scripts\youtube_channel_to_md.py" `
@@ -65,8 +69,8 @@ It deliberately does not reuse the XHS browser extension. YouTube public video a
 
    If YouTube returns a bot/login challenge, explicitly opt in to browser-cookie access for that run, for example `--cookies-from-browser chrome` or `--cookies-from-browser "chrome:Default"`. This is a sensitive choice and is never enabled implicitly.
 
-5. For the requested first N videos, replace `--limit 5` with the user-specified N. The default tab is `/videos`; use `--channel-tab shorts` or `--channel-tab streams` only when explicitly requested. The batch is sequential by default, records each item's status, and can resume with `--run-dir <existing-run-dir>`.
-6. Treat `notes/` as the user-facing output. Treat `run.json`, `source/`, and `items/` as provenance and recovery evidence.
+6. For the requested first N videos, replace `--limit 5` with the user-specified N. The default tab is `/videos`; use `--channel-tab shorts` or `--channel-tab streams` only when explicitly requested. The batch is sequential by default, records each item's status, and can resume with `--run-dir <existing-run-dir>`.
+7. Treat `notes/` as the user-facing output. Treat `run.json`, `source/`, and `items/` as provenance and recovery evidence.
 
 ## 清空 OSS 内存（临时文件清理）
 
@@ -106,6 +110,7 @@ python "<skill-root>\scripts\oss_cleanup.py" `
 Each note keeps the common project fields:
 
 ```yaml
+contract_version: 1
 platform: youtube
 source_url: original YouTube page URL
 source_id: YouTube video ID
@@ -114,10 +119,18 @@ title: video title
 published_at: original time when available
 captured_at: local capture time
 scope: single | creator_recent_n
-transcript_source: asr | unavailable
-media_delivery: youtube-cdn | oss-signed-url | unknown
-status: captured | failed | cancelled
+transcript_source: platform_caption | asr | unavailable | null
+caption_language: language | null
+caption_type: manual | automatic | translated | null
+asr_status: pending | skipped | completed | failed | cancelled
+asr_model: model | null
+task_id: task ID | null
+media_delivery: oss-signed-url | null
+status: running | captured | partial | failed | pending_review | cancelled
+review_status: unreviewed | sampled | needs_review
 ```
+
+The same contract is used for single-video notes and each channel-batch item. `null` means that a field does not apply or has not been reached yet. `captured` means the transcript was produced and is non-empty; it does not mean the content has been fact-checked. A usable platform caption sets `transcript_source=platform_caption`, `asr_status=skipped`, and records its language/type. If no usable caption exists, the pipeline falls back to ASR and records `transcript_source=asr`. Automatic translated captions are not used by default.
 
 For a single video, the output directory contains:
 
@@ -126,13 +139,15 @@ note.md
 manifest.json
 metadata.json
 video/
+  captions/
+    <language>.<type>.browser.txt
+    selection.json
+  transcript.md
   request-info.json
-  resolution.json
   oss.json
   submit.json
   task.json
   transcription.json
-  transcript.md
 ```
 
 If a stage fails, `video/error.json` and a partial Markdown note are retained. A partial or failed note must not be described as a complete transcript.
@@ -155,14 +170,17 @@ The batch's “first N” means the order returned by yt-dlp for the public chan
 
 ## Boundaries and evidence
 
-- `yt-dlp` resolves a temporary signed URL; the Skill does not treat that URL as a permanent source and redacts query values in persisted diagnostics.
-- The default route does not download the full video to local disk and does not require FFmpeg or OSS. If Bailian cannot fetch the resolved YouTube CDN URL, the Skill records failure; use `--via-oss` for the explicit local-upload fallback.
-- The OSS fallback keeps the Bucket private, uploads only the selected local media file, and gives Bailian a short-lived signed GET URL. The signed URL is never persisted.
+- A Computer Use export is also a platform-caption source: retain the returned UTF-8 .txt file, record retrieval_method=computer_use under the manifest captions object, and set transcript_source=platform_caption plus asr_status=skipped. The browser export path itself is not written into the Markdown body.
+- Computer Use does not grant the local Python process the Chrome login state. It is a separate, read-only browser route; if the current environment cannot control an authorized Chrome tab, report that prerequisite instead of silently claiming a caption capture.
+
+- For a single video, yt-dlp is used only to download a local audio file after Computer Use confirms that no usable Transcript exists. It is never used to extract the single video's captions or to resolve a YouTube CDN URL for Bailian.
+- The ASR route always uploads the local media file to the private OSS Bucket and gives Bailian a short-lived signed GET URL. The signed URL is never persisted.
 - `qwen-audio-3.0-asr-flash-filetrans` accepts one publicly reachable media URL per task and supports long media within the service's documented limits. The result URL is temporary and is downloaded immediately into `video/transcription.json`.
 - By default the Skill does not read browser cookies. If the user explicitly supplies `--cookies-from-browser`, yt-dlp reads that browser profile for the current run only; the Skill never saves the cookies. This may expose the account to YouTube rate limits or account risk, so use it only when necessary. The Skill still does not bypass login, CAPTCHA, age gates, or access controls. Private, members-only, region-blocked, age-restricted, live, or deleted videos may fail.
+- If Chrome's Windows DPAPI prevents `--cookies-from-browser chrome`, explicitly pass a Mozilla/Netscape-format cookie file with `--cookies <path>` instead. Export it yourself only when you understand that it is highly sensitive; keep it outside the repository and delete it when the run is finished. The Skill passes the path to yt-dlp for the current run and never persists it.
 - A batch completing means the pipeline finished its per-item work. It does not mean the transcript is factually correct; manually sample notes before using them as research material.
 - Channel batches are intentionally sequential. This limits accidental API bursts and makes partial recovery understandable. Do not start a second batch for the same channel while one is running.
-- Never persist `DASHSCOPE_API_KEY`, raw signed CDN URLs, or raw signed transcription-result URLs.
+- Never persist `DASHSCOPE_API_KEY`, raw signed media URLs, or raw signed transcription-result URLs.
 - OSS 清理默认是 dry-run；只有显式 `--execute` 加精确确认字符串才会删除对象。清理报告只保存对象键、大小和时间，不保存密钥或签名 URL。
 
 ## Individual debugging commands
@@ -173,10 +191,22 @@ yt-dlp --version
 python "<skill-root>\scripts\youtube_video_to_md.py" --help
 python "<skill-root>\scripts\youtube_channel_to_md.py" --help
 
-# only when YouTube asks for a logged-in/browser session
+# only when yt-dlp needs an explicit YouTube login source for metadata/audio download
 python "<skill-root>\scripts\youtube_video_to_md.py" `
   "<youtube-video-url>" `
   --cookies-from-browser chrome
+
+# alternative when Chrome Cookie decryption fails; keep the file outside the repo
+python "<skill-root>\scripts\youtube_video_to_md.py" `
+  "<youtube-video-url>" `
+  --cookies "$env:TEMP\youtube-cookies.txt"
+
+# use a browser-confirmed no-Transcript result and go directly to OSS ASR
+python "<skill-root>\scripts\youtube_video_to_md.py" `
+  "<youtube-video-url>" `
+  --browser-no-transcript `
+  --browser-title "<visible-video-title>" `
+  --browser-author "<visible-channel-name>"
 
 # continue an interrupted batch
 python "<skill-root>\scripts\youtube_channel_to_md.py" `

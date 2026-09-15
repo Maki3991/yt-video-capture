@@ -1,4 +1,4 @@
 interface:
   display_name: "YouTube Video Capture"
-  short_description: "Transcribe YouTube videos and safely clean OSS media"
-  default_prompt: "Use $yt-video-capture to transcribe a YouTube video, collect the first N public channel videos, or preview and safely clean expired temporary OSS media; preserve traceable evidence and redact secrets."
+  short_description: "Capture YouTube transcripts to local Markdown"
+  default_prompt: "Use $yt-video-capture to capture a specified YouTube video's transcript through the user's authorized Computer Use Chrome session; skip visible ads, save browser Transcript locally when available, otherwise download local audio with yt-dlp, upload it to private OSS, and use Bailian ASR; or process a channel batch / clean temporary OSS media while preserving evidence and redacting secrets."

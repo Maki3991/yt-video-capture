@@ -16,9 +16,12 @@ from youtube_asr import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     YouTubeError,
+    build_transcript_contract,
+    caption_result_for_persist,
     clean_video_metadata,
     download_audio,
     get_video_metadata,
+    import_browser_transcript,
     read_json,
     safe_component,
     transcribe_media,
@@ -48,7 +51,7 @@ def _base_metadata(source_url: str) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="将一个 YouTube 视频用 yt-dlp + 百炼 ASR 保存为 Markdown。"
+        description="将一个 YouTube 视频的浏览器字幕或本地音频转为 Markdown。"
     )
     parser.add_argument("source", help="YouTube 单个视频链接")
     parser.add_argument(
@@ -67,6 +70,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="BROWSER[:PROFILE]",
         help="显式允许 yt-dlp 从浏览器读取 YouTube Cookie；默认不读取",
+    )
+    parser.add_argument(
+        "--cookies",
+        dest="cookies_file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="使用 Mozilla/Netscape 格式的 Cookie 文件；不要放入仓库",
+    )
+    parser.add_argument(
+        "--browser-transcript-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Computer Use 从已登录 YouTube 页面导出的文字稿文件；提供后跳过 yt-dlp、OSS 和百炼",
+    )
+    parser.add_argument(
+        "--browser-no-transcript",
+        action="store_true",
+        help="Computer Use 已检查页面但没有可用 Transcript；直接进入本地音频→OSS→百炼",
+    )
+    parser.add_argument(
+        "--browser-title",
+        default=None,
+        help="浏览器页面标题；用于补充本地 note 的视频标题",
+    )
+    parser.add_argument(
+        "--browser-author",
+        default=None,
+        help="浏览器页面可见的频道名；可选",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"百炼模型；默认 {DEFAULT_MODEL}")
     parser.add_argument(
@@ -97,15 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="请求说话人分离；长视频建议谨慎使用",
     )
     parser.add_argument(
-        "--via-oss",
-        action="store_true",
-        help="先使用本地音频，再上传私有 OSS，通过短时签名 URL 交给百炼",
-    )
-    parser.add_argument(
         "--media-file",
         type=Path,
         default=None,
-        help="--via-oss 时使用已有本地媒体文件；不填则先用 yt-dlp 下载音频",
+        help="ASR 时使用已有本地媒体文件；不填则先用 yt-dlp 下载音频再上传 OSS",
     )
     parser.add_argument(
         "--metadata-file",
@@ -130,13 +158,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cookies_from_browser and args.cookies_file:
+        parser.error("--cookies-from-browser 与 --cookies 只能二选一")
+    if args.browser_transcript_file is not None and args.browser_no_transcript:
+        parser.error("--browser-transcript-file 与 --browser-no-transcript 只能二选一")
+    if args.browser_transcript_file is not None and (
+        args.cookies_from_browser
+        or args.cookies_file
+        or args.metadata_file is not None
+        or args.media_file is not None
+    ):
+        parser.error(
+            "--browser-transcript-file 不能与 Cookie、--metadata-file 或 --media-file 一起使用"
+        )
+    if args.browser_no_transcript and args.metadata_file is not None:
+        parser.error("--browser-no-transcript 不能与 --metadata-file 一起使用")
+    if (args.browser_title or args.browser_author) and not (
+        args.browser_transcript_file or args.browser_no_transcript
+    ):
+        parser.error("--browser-title/--browser-author 必须与浏览器字幕或 --browser-no-transcript 一起使用")
     if args.poll_interval <= 0 or args.timeout <= 0:
         parser.error("--poll-interval 和 --timeout 必须是正整数")
     if args.oss_url_expires <= 0:
         parser.error("--oss-url-expires 必须是正整数")
-    if args.media_file is not None and not args.via_oss:
-        parser.error("--media-file 必须与 --via-oss 一起使用")
-
     try:
         source_url = validate_video_url(args.source)
     except YouTubeError as exc:
@@ -150,20 +194,44 @@ def main(argv: list[str] | None = None) -> int:
     metadata = _base_metadata(source_url)
     manifest: dict[str, Any] = {
         "schema_version": 1,
-        "platform": "youtube",
-        "scope": "single",
-        "status": "running",
-        "source_url": source_url,
-        "source_id": metadata.get("source_id"),
-        "captured_at": utc_now(),
-        "transcript_source": "asr",
+        **build_transcript_contract(
+            metadata,
+            scope="single",
+            status="running",
+            transcript_source=None,
+            asr_status="pending",
+        ),
         "output_dir": str(output),
         "note_path": str(note_path),
     }
     write_json(output / "metadata.json", metadata, sanitize=True)
+    caption_result: dict[str, Any] = {"status": "not_run"}
 
     try:
-        if args.metadata_file is not None:
+        if args.browser_transcript_file is not None:
+            print("[youtube-video] importing Computer Use browser transcript...", flush=True)
+            browser_result = import_browser_transcript(
+                source_url,
+                args.browser_transcript_file,
+                output / "video",
+                title=args.browser_title,
+                author=args.browser_author,
+            )
+            metadata = browser_result.pop("metadata")
+            caption_result = browser_result
+        elif args.browser_no_transcript:
+            print(
+                "[youtube-video] Computer Use 已确认没有可用 Transcript；"
+                "跳过 yt-dlp 字幕检查，进入本地音频→OSS→百炼...",
+                flush=True,
+            )
+            metadata = _base_metadata(source_url)
+            if args.browser_title:
+                metadata["title"] = " ".join(args.browser_title.split())
+            if args.browser_author:
+                metadata["author"] = " ".join(args.browser_author.split())
+            metadata["metadata_source"] = "computer_use"
+        elif args.metadata_file is not None:
             metadata_path = args.metadata_file.expanduser().resolve()
             print(f"[youtube-video] reusing metadata: {metadata_path}", flush=True)
             metadata = read_json(metadata_path)
@@ -179,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_url,
                 args.yt_dlp,
                 args.cookies_from_browser,
+                args.cookies_file,
             )
         write_json(output / "metadata.json", metadata, sanitize=True)
         manifest.update(
@@ -191,29 +260,85 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_json(manifest_path, manifest, sanitize=True)
 
-        media_path: Path | None = None
-        if args.via_oss:
-            if args.media_file is not None:
-                media_path = args.media_file.expanduser().resolve()
-                print(f"[youtube-video] using local media: {media_path}", flush=True)
-            else:
-                print("[youtube-video] downloading audio locally for OSS...", flush=True)
-                media_path = download_audio(
-                    source_url,
-                    output / "video",
-                    explicit_yt_dlp=args.yt_dlp,
-                    cookies_from_browser=args.cookies_from_browser,
-                )
-                print(f"[youtube-video] downloaded media: {media_path}", flush=True)
-            delivery_message = "uploading media to private OSS and submitting ASR"
+        if args.browser_transcript_file is not None:
+            manifest["captions"] = caption_result_for_persist(caption_result)
+        elif args.browser_no_transcript:
+            manifest["captions"] = {
+                "status": "not_available",
+                "retrieval_method": "computer_use",
+                "reason": "no_usable_transcript",
+            }
         else:
-            delivery_message = "resolving a temporary media URL and submitting ASR"
-        print(f"[youtube-video] {delivery_message}...", flush=True)
+            manifest["captions"] = {
+                "status": "not_run",
+                "retrieval_method": "computer_use",
+                "reason": "browser_check_not_supplied",
+            }
+        write_json(manifest_path, manifest, sanitize=True)
+        if caption_result.get("status") == "succeeded":
+            caption_path = f"video/{caption_result['raw_path']}"
+            write_video_note(
+                note_path,
+                metadata,
+                scope="single",
+                status="captured",
+                transcript_source="platform_caption",
+                caption_language=caption_result.get("caption_language"),
+                caption_type=caption_result.get("caption_type"),
+                asr_status="skipped",
+                transcript=caption_result["transcription"],
+                transcript_path="video/transcript.md",
+                caption_path=caption_path,
+            )
+            manifest.update(
+                {
+                    **build_transcript_contract(
+                        metadata,
+                        scope="single",
+                        status="captured",
+                        transcript_source="platform_caption",
+                        caption_language=caption_result.get("caption_language"),
+                        caption_type=caption_result.get("caption_type"),
+                        asr_status="skipped",
+                        captured_at=str(manifest.get("captured_at") or ""),
+                    ),
+                    "captions": caption_result_for_persist(caption_result),
+                    "completed_at": utc_now(),
+                }
+            )
+            write_json(manifest_path, manifest, sanitize=True)
+            print(
+                f"[youtube-video] 使用 YouTube 字幕（{caption_result.get('caption_language')}/"
+                f"{caption_result.get('caption_type')}），已跳过 ASR"
+            )
+            print(f"[youtube-video] Markdown: {note_path}")
+            print(f"[youtube-video] evidence: {output}")
+            print("YOUTUBE_STATUS=captured")
+            return 0
+        if args.browser_transcript_file is None:
+            print(
+                "[youtube-video] 未使用浏览器字幕；进入本地音频→私有 OSS→百炼 ASR...",
+                flush=True,
+            )
+
+        media_path: Path
+        if args.media_file is not None:
+            media_path = args.media_file.expanduser().resolve()
+            print(f"[youtube-video] using local media: {media_path}", flush=True)
+        else:
+            print("[youtube-video] downloading audio locally for OSS...", flush=True)
+            media_path = download_audio(
+                source_url,
+                output / "video",
+                explicit_yt_dlp=args.yt_dlp,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies_file,
+            )
+            print(f"[youtube-video] downloaded media: {media_path}", flush=True)
+        print("[youtube-video] uploading media to private OSS and submitting ASR...", flush=True)
         result = transcribe_media(
             source_url,
             output / "video",
-            explicit_yt_dlp=args.yt_dlp,
-            cookies_from_browser=args.cookies_from_browser,
             model=args.model,
             api_base_url=(
                 args.api_base_url
@@ -234,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
             scope="single",
             status="captured",
             transcript_source="asr",
+            asr_status="completed",
             media_delivery=result.get("delivery"),
             transcript=result["transcription"],
             asr_model=result["model"],
@@ -242,7 +368,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest.update(
             {
-                "status": "captured",
+                **build_transcript_contract(
+                    metadata,
+                    scope="single",
+                    status="captured",
+                    transcript_source="asr",
+                    asr_status="completed",
+                    asr_model=result["model"],
+                    task_id=result["task_id"],
+                    media_delivery=result.get("delivery"),
+                    captured_at=str(manifest.get("captured_at") or ""),
+                ),
                 "asr": {
                     "status": "completed",
                     "model": result["model"],
@@ -267,18 +403,33 @@ def main(argv: list[str] | None = None) -> int:
         error = str(exc)
         status = "failed"
 
+    if caption_result.get("status") in {"skipped", "failed"}:
+        caption_reason = caption_result.get("reason") or "caption_unavailable"
+        error = f"字幕阶段 {caption_reason}；随后 ASR 阶段：{error}"
+
     write_video_note(
         note_path,
         metadata,
         scope="single",
         status=status,
         transcript_source="unavailable",
+        asr_status="cancelled" if status == "cancelled" else "failed",
+        asr_model=args.model,
+        media_delivery=None if args.browser_transcript_file is not None else "oss-signed-url",
         error=error,
     )
     manifest.update(
         {
-            "status": status,
-            "transcript_source": "unavailable",
+            **build_transcript_contract(
+                metadata,
+                scope="single",
+                status=status,
+                transcript_source="unavailable",
+                asr_status="cancelled" if status == "cancelled" else "failed",
+                asr_model=args.model,
+                media_delivery=None if args.browser_transcript_file is not None else "oss-signed-url",
+                captured_at=str(manifest.get("captured_at") or ""),
+            ),
             "error": error[:3000],
             "updated_at": utc_now(),
         }
