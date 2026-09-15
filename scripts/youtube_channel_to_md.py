@@ -17,6 +17,7 @@ from youtube_asr import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     YouTubeError,
+    asr_checkpoint_state,
     artifact_path_for_output,
     build_transcript_contract,
     caption_result_for_persist,
@@ -26,6 +27,7 @@ from youtube_asr import (
     get_video_metadata,
     initial_stage_states,
     metadata_from_flat_item,
+    read_json,
     safe_component,
     safe_error,
     transcribe_media,
@@ -467,13 +469,24 @@ def main(argv: list[str] | None = None) -> int:
             item_dir = _item_dir(run_root, index, flat_item)
             item_dir.mkdir(parents=True, exist_ok=True)
             flat_item.setdefault("stages", initial_stage_states())
+            resume_state = (
+                asr_checkpoint_state(item_dir / "video")
+                if args.run_dir is not None
+                else {}
+            )
+            resume_asr = bool(resume_state.get("task_id"))
             current_index = index
             current_item = flat_item
             current_item_dir = item_dir
             current_source_url = source_url
-            metadata = metadata_from_flat_item(flat_item, source_url)
+            metadata_path = item_dir / "metadata.json"
+            if resume_asr and metadata_path.is_file():
+                metadata = read_json(metadata_path)
+                print(f"[youtube-channel] {index}/{len(items)} 复用已有元数据", flush=True)
+            else:
+                metadata = metadata_from_flat_item(flat_item, source_url)
             metadata_error = ""
-            current_item_stage = "metadata"
+            current_item_stage = None if resume_asr else "metadata"
             _update_item(
                 run_manifest,
                 index,
@@ -485,46 +498,48 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             _persist_run(run_manifest, run_manifest_path)
-            current_item_stage = "metadata"
-            _record_item_stage(
-                run_manifest,
-                run_manifest_path,
-                flat_item,
-                run_root,
-                source_url,
-                "metadata",
-                "running",
-                artifact_root=item_dir,
-            )
-            try:
-                print(f"[youtube-channel] {index}/{len(items)} 读取元数据：{source_url}", flush=True)
-                metadata = get_video_metadata(
+            if not resume_asr:
+                current_item_stage = "metadata"
+                _record_item_stage(
+                    run_manifest,
+                    run_manifest_path,
+                    flat_item,
+                    run_root,
                     source_url,
-                    args.yt_dlp,
-                    args.cookies_from_browser,
-                    args.cookies_file,
+                    "metadata",
+                    "running",
+                    artifact_root=item_dir,
                 )
-            except YouTubeError as exc:
-                metadata_error = safe_error(str(exc), source_url)
-                print(
-                    f"[youtube-channel] WARNING: 元数据补充失败，将继续尝试转写：{metadata_error}",
-                    file=sys.stderr,
-                )
+                try:
+                    print(f"[youtube-channel] {index}/{len(items)} 读取元数据：{source_url}", flush=True)
+                    metadata = get_video_metadata(
+                        source_url,
+                        args.yt_dlp,
+                        args.cookies_from_browser,
+                        args.cookies_file,
+                    )
+                except YouTubeError as exc:
+                    metadata_error = safe_error(str(exc), source_url)
+                    print(
+                        f"[youtube-channel] WARNING: 元数据补充失败，将继续尝试转写：{metadata_error}",
+                        file=sys.stderr,
+                    )
             write_json(item_dir / "metadata.json", metadata, sanitize=True)
-            _record_item_stage(
-                run_manifest,
-                run_manifest_path,
-                flat_item,
-                run_root,
-                source_url,
-                "metadata",
-                "failed" if metadata_error else "succeeded",
-                artifact_paths=("metadata.json",),
-                artifact_root=item_dir,
-                error=metadata_error or None,
-                retryable=bool(metadata_error),
-            )
-            current_item_stage = None
+            if not resume_asr:
+                _record_item_stage(
+                    run_manifest,
+                    run_manifest_path,
+                    flat_item,
+                    run_root,
+                    source_url,
+                    "metadata",
+                    "failed" if metadata_error else "succeeded",
+                    artifact_paths=("metadata.json",),
+                    artifact_root=item_dir,
+                    error=metadata_error or None,
+                    retryable=bool(metadata_error),
+                )
+                current_item_stage = None
             note_path = _note_path(run_root, index, metadata)
             relative_transcript = f"../items/{item_dir.name}/video/transcript.md"
             item_updates: dict[str, Any] = {
@@ -543,33 +558,39 @@ def main(argv: list[str] | None = None) -> int:
             }
             if metadata_error:
                 item_updates["metadata_error"] = metadata_error[:3000]
-            current_item_stage = "browser_transcript"
-            _record_item_stage(
-                run_manifest,
-                run_manifest_path,
-                flat_item,
-                run_root,
-                source_url,
-                "browser_transcript",
-                "running",
-                artifact_root=item_dir / "video",
-            )
-            try:
-                caption_result = download_caption(
-                    source_url,
-                    item_dir / "video",
-                    language_preferences=_parse_language_hints(args.caption_languages),
-                    allow_translated=args.allow_translated_captions,
-                    explicit_yt_dlp=args.yt_dlp,
-                    cookies_from_browser=args.cookies_from_browser,
-                    cookies_file=args.cookies_file,
-                )
-            except (OSError, YouTubeError) as exc:
+            if resume_asr:
                 caption_result = {
-                    "status": "failed",
-                    "reason": "caption_fetch_failed",
-                    "error": safe_error(str(exc), source_url),
+                    "status": "skipped",
+                    "reason": "resume_existing_asr",
                 }
+            else:
+                current_item_stage = "browser_transcript"
+                _record_item_stage(
+                    run_manifest,
+                    run_manifest_path,
+                    flat_item,
+                    run_root,
+                    source_url,
+                    "browser_transcript",
+                    "running",
+                    artifact_root=item_dir / "video",
+                )
+                try:
+                    caption_result = download_caption(
+                        source_url,
+                        item_dir / "video",
+                        language_preferences=_parse_language_hints(args.caption_languages),
+                        allow_translated=args.allow_translated_captions,
+                        explicit_yt_dlp=args.yt_dlp,
+                        cookies_from_browser=args.cookies_from_browser,
+                        cookies_file=args.cookies_file,
+                    )
+                except (OSError, YouTubeError) as exc:
+                    caption_result = {
+                        "status": "failed",
+                        "reason": "caption_fetch_failed",
+                        "error": safe_error(str(exc), source_url),
+                    }
             caption_status = str(caption_result.get("status") or "failed")
             if caption_status == "succeeded":
                 _record_item_stage(
@@ -616,7 +637,8 @@ def main(argv: list[str] | None = None) -> int:
                     artifact_root=item_dir / "video",
                 )
             current_item_stage = None
-            item_updates["captions"] = caption_result_for_persist(caption_result)
+            if not resume_asr:
+                item_updates["captions"] = caption_result_for_persist(caption_result)
             _update_item(run_manifest, index, item_updates)
             _persist_run(run_manifest, run_manifest_path)
 
@@ -740,37 +762,83 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             try:
-                print(f"[youtube-channel] {index}/{len(items)} 下载本地音频并上传 OSS：{metadata.get('title')}", flush=True)
-                current_item_stage = "media_download"
-                _record_item_stage(
-                    run_manifest,
-                    run_manifest_path,
-                    flat_item,
-                    run_root,
-                    source_url,
-                    current_item_stage,
-                    "running",
-                    artifact_root=item_dir / "video",
+                existing_audio = next(
+                    (
+                        path
+                        for path in (item_dir / "video").glob("source.*")
+                        if path.is_file() and path.suffix.lower() not in {".json", ".md"}
+                    ),
+                    None,
                 )
-                media_path = download_audio(
-                    source_url,
-                    item_dir / "video",
-                    explicit_yt_dlp=args.yt_dlp,
-                    cookies_from_browser=args.cookies_from_browser,
-                    cookies_file=args.cookies_file,
+                resumable_task = bool(
+                    resume_state.get("task_id")
+                    and str(resume_state.get("task_status") or "").upper()
+                    not in {"FAILED", "UNKNOWN"}
                 )
-                _record_item_stage(
-                    run_manifest,
-                    run_manifest_path,
-                    flat_item,
-                    run_root,
-                    source_url,
-                    current_item_stage,
-                    "succeeded",
-                    artifact_paths=(str(media_path),),
-                    artifact_root=run_root,
-                )
-                current_item_stage = None
+                if resume_asr and (resumable_task or existing_audio is not None):
+                    media_path = existing_audio
+                    _record_item_stage(
+                        run_manifest,
+                        run_manifest_path,
+                        flat_item,
+                        run_root,
+                        source_url,
+                        "media_download",
+                        "skipped",
+                        artifact_paths=(str(existing_audio),) if existing_audio else (),
+                        reason=(
+                            "resuming_existing_task"
+                            if resumable_task
+                            else "reusing_existing_media"
+                        ),
+                        artifact_root=run_root,
+                    )
+                    current_item_stage = None
+                    if existing_audio:
+                        print(f"[youtube-channel] {index}/{len(items)} 复用已有本地音频", flush=True)
+                    else:
+                        print(f"[youtube-channel] {index}/{len(items)} 复用已有 ASR task_id，跳过音频下载", flush=True)
+                else:
+                    print(
+                        f"[youtube-channel] {index}/{len(items)} 下载本地音频并上传 OSS：{metadata.get('title')}",
+                        flush=True,
+                    )
+                    current_item_stage = "media_download"
+                    _record_item_stage(
+                        run_manifest,
+                        run_manifest_path,
+                        flat_item,
+                        run_root,
+                        source_url,
+                        current_item_stage,
+                        "running",
+                        artifact_root=item_dir / "video",
+                    )
+                    media_path = download_audio(
+                        source_url,
+                        item_dir / "video",
+                        explicit_yt_dlp=args.yt_dlp,
+                        cookies_from_browser=args.cookies_from_browser,
+                        cookies_file=args.cookies_file,
+                    )
+                    _record_item_stage(
+                        run_manifest,
+                        run_manifest_path,
+                        flat_item,
+                        run_root,
+                        source_url,
+                        current_item_stage,
+                        "succeeded",
+                        artifact_paths=(str(media_path),),
+                        artifact_root=run_root,
+                    )
+                    current_item_stage = None
+                if resumable_task:
+                    print(
+                        f"[youtube-channel] {index}/{len(items)} resuming the existing ASR task; "
+                        "skipping OSS upload and resubmission",
+                        flush=True,
+                    )
                 result = transcribe_media(
                     source_url,
                     item_dir / "video",
@@ -781,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
                     language_hints=language_hints,
                     diarization=args.diarization,
                     media_path=media_path,
+                    resume=resume_asr,
                     on_stage=_make_asr_stage_callback(
                         run_manifest,
                         run_manifest_path,

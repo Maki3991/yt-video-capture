@@ -75,6 +75,15 @@ PIPELINE_STAGES = (
     "transcript_download",
     "markdown_render",
 )
+ASR_CHECKPOINT_FILES = (
+    "request-info.json",
+    "oss.json",
+    "submit.json",
+    "task.json",
+    "transcription.json",
+    "error.json",
+    "transcript.md",
+)
 STAGE_STATUSES = {
     "pending",
     "running",
@@ -327,6 +336,140 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise YouTubeError(f"JSON 顶层不是对象：{path}")
     return value
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return read_json(path)
+
+
+def _task_id_from_payload(value: dict[str, Any] | None) -> str:
+    if not isinstance(value, dict):
+        return ""
+    direct = str(value.get("task_id") or "").strip()
+    if direct:
+        return direct
+    output = value.get("output")
+    output = output if isinstance(output, dict) else {}
+    return str(output.get("task_id") or "").strip()
+
+
+def _task_status(task: dict[str, Any] | None) -> str:
+    if not isinstance(task, dict):
+        return ""
+    output = task.get("output")
+    output = output if isinstance(output, dict) else {}
+    return str(output.get("task_status") or "").strip().upper()
+
+
+def _asr_attempt_number(artifact_dir: Path) -> int:
+    """Find the latest durable ASR attempt number without reading secrets."""
+
+    attempt = 0
+    request_info = _read_optional_json(artifact_dir / "request-info.json")
+    if request_info:
+        try:
+            attempt = max(attempt, int(request_info.get("attempt") or 0))
+        except (TypeError, ValueError):
+            pass
+    attempts_dir = artifact_dir / "attempts"
+    if attempts_dir.is_dir():
+        for child in attempts_dir.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                attempt = max(attempt, int(child.name))
+            except ValueError:
+                continue
+    if attempt == 0 and any((artifact_dir / name).is_file() for name in ASR_CHECKPOINT_FILES):
+        attempt = 1
+    return attempt
+
+
+def _load_asr_checkpoint(artifact_dir: Path) -> dict[str, Any]:
+    artifact_dir = artifact_dir.expanduser().resolve()
+    request_info = _read_optional_json(artifact_dir / "request-info.json")
+    submit = _read_optional_json(artifact_dir / "submit.json")
+    task = _read_optional_json(artifact_dir / "task.json")
+    transcription = _read_optional_json(artifact_dir / "transcription.json")
+    task_id = (
+        _task_id_from_payload(submit)
+        or _task_id_from_payload(request_info)
+        or _task_id_from_payload(task)
+    )
+    return {
+        "request_info": request_info or {},
+        "submit": submit or {},
+        "task": task,
+        "transcription": transcription,
+        "task_id": task_id,
+        "task_status": _task_status(task),
+        "attempt": _asr_attempt_number(artifact_dir),
+    }
+
+
+def asr_checkpoint_state(artifact_dir: Path) -> dict[str, Any]:
+    """Return the non-sensitive part of an ASR checkpoint for callers."""
+
+    checkpoint = _load_asr_checkpoint(artifact_dir)
+    transcription = checkpoint.get("transcription")
+    return {
+        "task_id": checkpoint.get("task_id") or None,
+        "task_status": checkpoint.get("task_status") or None,
+        "attempt": checkpoint.get("attempt") or 0,
+        "has_transcription": bool(
+            isinstance(transcription, dict) and transcript_has_content(transcription)
+        ),
+    }
+
+
+def _archive_current_attempt(
+    artifact_dir: Path,
+    attempt: int,
+    *,
+    task_id: str | None,
+    task_status: str | None,
+) -> Path | None:
+    """Preserve the active checkpoint before a new ASR attempt replaces it."""
+
+    if attempt <= 0:
+        return None
+    existing = [artifact_dir / name for name in ASR_CHECKPOINT_FILES if (artifact_dir / name).is_file()]
+    if not existing:
+        return None
+    target = artifact_dir / "attempts" / f"{attempt:03d}"
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for source in existing:
+        destination = target / source.name
+        if not destination.exists():
+            shutil.copy2(source, destination)
+        copied.append(destination.name)
+    write_json(
+        target / "attempt.json",
+        {
+            "schema_version": 1,
+            "attempt": attempt,
+            "task_id": task_id or None,
+            "task_status": task_status or None,
+            "archived_at": utc_now(),
+            "artifact_files": copied,
+        },
+        sanitize=True,
+    )
+    return target
+
+
+def _clear_active_attempt(artifact_dir: Path) -> None:
+    """Remove replaceable root checkpoints while keeping local media intact."""
+
+    for name in ASR_CHECKPOINT_FILES:
+        path = artifact_dir / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
 
 
 def redact_url(value: str) -> str:
@@ -1761,149 +1904,367 @@ def transcribe_media(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     language_hints: Iterable[str] | None = None,
     diarization: bool = False,
-    media_path: Path,
+    media_path: Path | None = None,
     oss_object_key: str | None = None,
     oss_url_expires: int = 3600,
+    resume: bool = False,
     on_stage: StageCallback | None = None,
 ) -> dict[str, Any]:
-    """Deliver one media file to Bailian, poll the ASR task and save its result."""
+    """Deliver local media to Bailian, or explicitly resume a saved ASR task."""
 
     source_url = validate_video_url(source_url)
     if poll_interval <= 0 or timeout <= 0:
         raise YouTubeError("轮询间隔和超时时间必须是正整数。")
     if oss_url_expires <= 0:
         raise YouTubeError("OSS 签名 URL 有效期必须是正整数秒数。")
-    media_path = Path(media_path).expanduser().resolve()
-    if not media_path.is_file():
-        raise YouTubeError(f"找不到待上传的本地媒体文件：{media_path}")
+    artifact_dir = artifact_dir.expanduser().resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    api_base_url = api_base_url.rstrip("/")
+    model = str(model).strip() or DEFAULT_MODEL
+    delivery = "oss-signed-url"
+    checkpoint = _load_asr_checkpoint(artifact_dir) if resume else {}
+    checkpoint_task_id = str(checkpoint.get("task_id") or "").strip()
+    checkpoint_task = checkpoint.get("task")
+    checkpoint_transcription = checkpoint.get("transcription")
+    attempt = int(checkpoint.get("attempt") or 0)
+    transcript_path = artifact_dir / "transcript.md"
+
+    # A completed local result is already the strongest checkpoint. Re-rendering
+    # it, if necessary, must not require a new API request or another API key.
+    if (
+        resume
+        and checkpoint_task_id
+        and isinstance(checkpoint_transcription, dict)
+        and transcript_has_content(checkpoint_transcription)
+    ):
+        request_info = checkpoint.get("request_info")
+        request_info = request_info if isinstance(request_info, dict) else {}
+        checkpoint_model = str(request_info.get("model") or model).strip() or model
+        if not transcript_path.is_file():
+            _notify_stage(
+                on_stage,
+                "asr_submit",
+                "succeeded",
+                artifact_paths=("submit.json",),
+                reason="checkpoint_reused",
+            )
+            _notify_stage(
+                on_stage,
+                "asr_poll",
+                "succeeded",
+                artifact_paths=("task.json",),
+                reason="checkpoint_reused",
+            )
+            _notify_stage(
+                on_stage,
+                "transcript_download",
+                "succeeded",
+                artifact_paths=("transcription.json",),
+                reason="checkpoint_reused",
+            )
+            _notify_stage(on_stage, "markdown_render", "running", reason="checkpoint_reused")
+            write_transcript_markdown(
+                transcript_path,
+                checkpoint_transcription,
+                checkpoint_model,
+                checkpoint_task_id,
+            )
+            _notify_stage(
+                on_stage,
+                "markdown_render",
+                "succeeded",
+                artifact_paths=("transcript.md",),
+                reason="checkpoint_reused",
+            )
+        request_info.update(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "model": checkpoint_model,
+                "source_url": source_url,
+                "api_base_url": api_base_url,
+                "delivery": request_info.get("delivery") or delivery,
+                "attempt": max(1, attempt),
+                "task_id": checkpoint_task_id,
+                "resumed_at": utc_now(),
+                "completed_at": utc_now(),
+            }
+        )
+        write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
+        return {
+            "status": "completed",
+            "model": checkpoint_model,
+            "task_id": checkpoint_task_id,
+            "delivery": request_info.get("delivery") or delivery,
+            "resolved_host": str(request_info.get("resolved_host") or ""),
+            "oss_object_key": request_info.get("oss_object_key"),
+            "transcript_path": str(transcript_path),
+            "transcription": checkpoint_transcription,
+            "result": {},
+            "resumed": True,
+        }
+
     api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
     if not api_key:
         raise YouTubeError(
             "DASHSCOPE_API_KEY 未配置。请在当前 PowerShell 会话设置环境变量后重试。"
         )
 
-    artifact_dir = artifact_dir.expanduser().resolve()
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    api_base_url = api_base_url.rstrip("/")
-    model = str(model).strip() or DEFAULT_MODEL
-    delivery = "oss-signed-url"
-    request_info = {
-        "schema_version": 1,
-        "status": "running",
-        "model": model,
-        "source_url": source_url,
-        "api_base_url": api_base_url,
-        "delivery": delivery,
-        "submitted_at": utc_now(),
-    }
-    write_json(artifact_dir / "request-info.json", request_info)
-
+    task_id = checkpoint_task_id if resume else ""
+    task = checkpoint_task if isinstance(checkpoint_task, dict) else None
+    transcription = checkpoint_transcription if isinstance(checkpoint_transcription, dict) else None
+    result_item: dict[str, Any] = {}
     signed_url = ""
-    task_id = ""
+    oss_info: dict[str, Any] = {}
     active_stage: str | None = None
-    try:
-        default_key = (
-            f"youtube-asr/{safe_component(video_id_from_url(source_url), fallback='video')}"
-            f"{media_path.suffix.lower() or '.bin'}"
-        )
-        active_stage = "oss_upload"
-        _notify_stage(on_stage, active_stage, "running")
-        oss_info = upload_local_media_to_oss(
-            media_path,
-            oss_object_key or default_key,
-            signed_url_expires=oss_url_expires,
-        )
-        signed_url = str(oss_info["signed_url"])
-        write_json(
-            artifact_dir / "oss.json",
-            {
-                "schema_version": 1,
-                "status": "uploaded",
-                "bucket": oss_info["bucket"],
-                "object_key": oss_info["object_key"],
-                "local_path": oss_info["local_path"],
-                "size_bytes": oss_info["size_bytes"],
-                "content_type": oss_info["content_type"],
-                "signed_url_expires": oss_info["signed_url_expires"],
-                "uploaded_at": oss_info["uploaded_at"],
-            },
-            sanitize=True,
-        )
-        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("oss.json",))
+    attempt_initialized = False
+    reused_checkpoint_task = False
 
-        parameters: dict[str, Any] = {"channel_id": [0]}
-        hints = [str(item).strip() for item in (language_hints or []) if str(item).strip()]
-        if hints:
-            parameters["language_hints"] = hints[:4]
-        if diarization:
-            parameters["diarization_enabled"] = True
-        submit_body = {
+    def new_request_info(current_attempt: int) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "status": "running",
             "model": model,
-            "input": {"file_urls": [signed_url]},
-            "parameters": parameters,
+            "source_url": source_url,
+            "api_base_url": api_base_url,
+            "delivery": delivery,
+            "attempt": current_attempt,
+            "submitted_at": utc_now(),
         }
-        active_stage = "asr_submit"
-        _notify_stage(on_stage, active_stage, "running")
-        submit = _api_json(
-            "POST",
-            f"{api_base_url}/services/audio/asr/transcription",
-            api_key,
-            submit_body,
-            asynchronous=True,
-        )
-        write_json(artifact_dir / "submit.json", submit, sanitize=True)
-        submit_output = submit.get("output")
-        submit_output = submit_output if isinstance(submit_output, dict) else {}
-        task_id = str(submit_output.get("task_id") or "").strip()
+
+    checkpoint_request_info = checkpoint.get("request_info")
+    request_info: dict[str, Any] = (
+        dict(checkpoint_request_info)
+        if isinstance(checkpoint_request_info, dict)
+        else new_request_info(max(1, attempt or 1))
+    )
+
+    try:
+        if resume and task_id:
+            task_status = _task_status(task)
+            if task_status not in FINAL_STATUSES:
+                task = _api_json("GET", f"{api_base_url}/tasks/{task_id}", api_key)
+                task_status = _task_status(task)
+                write_json(artifact_dir / "task.json", task, sanitize=True)
+
+            if task_status in {"FAILED", "UNKNOWN"}:
+                _notify_stage(
+                    on_stage,
+                    "asr_poll",
+                    "failed",
+                    artifact_paths=("task.json",) if task else (),
+                    error=f"已有百炼任务状态为 {task_status}，准备创建新的 attempt。",
+                    retryable=True,
+                    reason="checkpoint_task_failed",
+                )
+                previous_attempt = max(1, attempt)
+                _archive_current_attempt(
+                    artifact_dir,
+                    previous_attempt,
+                    task_id=task_id,
+                    task_status=task_status,
+                )
+                _clear_active_attempt(artifact_dir)
+                attempt = previous_attempt + 1
+                task_id = ""
+                task = None
+                transcription = None
+                request_info = new_request_info(attempt)
+                write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
+                attempt_initialized = True
+            else:
+                checkpoint_model = str(
+                    (checkpoint.get("request_info") or {}).get("model") or model
+                ).strip()
+                if checkpoint_model:
+                    model = checkpoint_model
+                request_info = checkpoint.get("request_info")
+                request_info = request_info if isinstance(request_info, dict) else {}
+                request_info.update(
+                    {
+                        "schema_version": 1,
+                        "status": "running",
+                        "model": model,
+                        "source_url": source_url,
+                        "api_base_url": api_base_url,
+                        "delivery": delivery,
+                        "attempt": max(1, attempt),
+                        "task_id": task_id,
+                        "resumed_at": utc_now(),
+                    }
+                )
+                write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
+                _notify_stage(
+                    on_stage,
+                    "asr_submit",
+                    "succeeded",
+                    artifact_paths=("submit.json",),
+                    reason="resumed_existing_task",
+                )
+                reused_checkpoint_task = True
+
         if not task_id:
-            raise YouTubeError(f"提交成功响应中没有 task_id；详见 {artifact_dir / 'submit.json'}")
-        _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("submit.json",))
+            if resume and not attempt_initialized and attempt > 0 and any(
+                (artifact_dir / name).is_file() for name in ASR_CHECKPOINT_FILES
+            ):
+                previous_attempt = max(1, attempt)
+                _archive_current_attempt(
+                    artifact_dir,
+                    previous_attempt,
+                    task_id=None,
+                    task_status=str(checkpoint.get("task_status") or "") or None,
+                )
+                _clear_active_attempt(artifact_dir)
+                attempt = previous_attempt + 1
+                attempt_initialized = True
+            else:
+                attempt = max(1, attempt)
+            request_info = new_request_info(attempt)
+            write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
+
+            if media_path is None:
+                raise YouTubeError("创建新的 ASR 任务需要本地媒体文件，但没有提供 media_path。")
+            media_path = Path(media_path).expanduser().resolve()
+            if not media_path.is_file():
+                raise YouTubeError(f"找不到待上传的本地媒体文件：{media_path}")
+
+            default_key = (
+                f"youtube-asr/{safe_component(video_id_from_url(source_url), fallback='video')}"
+                f"{media_path.suffix.lower() or '.bin'}"
+            )
+            active_stage = "oss_upload"
+            _notify_stage(on_stage, active_stage, "running")
+            oss_info = upload_local_media_to_oss(
+                media_path,
+                oss_object_key or default_key,
+                signed_url_expires=oss_url_expires,
+            )
+            signed_url = str(oss_info["signed_url"])
+            write_json(
+                artifact_dir / "oss.json",
+                {
+                    "schema_version": 1,
+                    "status": "uploaded",
+                    "bucket": oss_info["bucket"],
+                    "object_key": oss_info["object_key"],
+                    "local_path": oss_info["local_path"],
+                    "size_bytes": oss_info["size_bytes"],
+                    "content_type": oss_info["content_type"],
+                    "signed_url_expires": oss_info["signed_url_expires"],
+                    "uploaded_at": oss_info["uploaded_at"],
+                },
+                sanitize=True,
+            )
+            _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("oss.json",))
+
+            parameters: dict[str, Any] = {"channel_id": [0]}
+            hints = [str(item).strip() for item in (language_hints or []) if str(item).strip()]
+            if hints:
+                parameters["language_hints"] = hints[:4]
+            if diarization:
+                parameters["diarization_enabled"] = True
+            submit_body = {
+                "model": model,
+                "input": {"file_urls": [signed_url]},
+                "parameters": parameters,
+            }
+            active_stage = "asr_submit"
+            _notify_stage(on_stage, active_stage, "running")
+            submit = _api_json(
+                "POST",
+                f"{api_base_url}/services/audio/asr/transcription",
+                api_key,
+                submit_body,
+                asynchronous=True,
+            )
+            write_json(artifact_dir / "submit.json", submit, sanitize=True)
+            task_id = _task_id_from_payload(submit)
+            if not task_id:
+                raise YouTubeError(f"提交成功响应中没有 task_id；详见 {artifact_dir / 'submit.json'}")
+            # This write is deliberately immediately after parsing task_id. If
+            # the process stops before the first poll, the next run still knows
+            # which billable task to query and will not submit another one.
+            request_info.update(
+                {
+                    "status": "submitted",
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "submitted_at": utc_now(),
+                }
+            )
+            write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
+            _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("submit.json",))
+            task = None
+            transcription = None
+        else:
+            # The existing task was found in a checkpoint, so its signed OSS
+            # URL has expired or is irrelevant. Never upload media again here.
+            active_stage = "asr_poll"
+            _notify_stage(on_stage, active_stage, "running", reason="resuming_existing_task")
 
         active_stage = "asr_poll"
-        _notify_stage(on_stage, active_stage, "running")
-        deadline = time.monotonic() + timeout
-        task: dict[str, Any] | None = None
-        last_status = ""
-        while True:
-            task = _api_json("GET", f"{api_base_url}/tasks/{task_id}", api_key)
-            task_output = task.get("output")
-            task_output = task_output if isinstance(task_output, dict) else {}
-            status = str(task_output.get("task_status") or "UNKNOWN").upper()
-            if status != last_status:
-                print(f"[youtube-asr] status: {status}", flush=True)
-                last_status = status
-            if status in FINAL_STATUSES:
-                break
-            if time.monotonic() > deadline:
-                raise YouTubeError(f"轮询超过 {timeout} 秒；task_id={task_id}。")
-            time.sleep(poll_interval)
+        if task is None or _task_status(task) not in FINAL_STATUSES:
+            deadline = time.monotonic() + timeout
+            last_status = ""
+            while True:
+                task = _api_json("GET", f"{api_base_url}/tasks/{task_id}", api_key)
+                task_status = _task_status(task) or "UNKNOWN"
+                write_json(artifact_dir / "task.json", task, sanitize=True)
+                if task_status != last_status:
+                    print(f"[youtube-asr] status: {task_status}", flush=True)
+                    last_status = task_status
+                if task_status in FINAL_STATUSES:
+                    break
+                if time.monotonic() > deadline:
+                    raise YouTubeError(f"轮询超过 {timeout} 秒；task_id={task_id}。")
+                time.sleep(poll_interval)
+        else:
+            task_status = _task_status(task)
+            # A persisted task response has redacted its result URL. Refresh
+            # successful tasks when the result JSON is not already local.
+            if task_status == "SUCCEEDED" and not (
+                isinstance(transcription, dict) and transcript_has_content(transcription)
+            ):
+                task = _api_json("GET", f"{api_base_url}/tasks/{task_id}", api_key)
+                task_status = _task_status(task) or "UNKNOWN"
+                write_json(artifact_dir / "task.json", task, sanitize=True)
 
-        write_json(artifact_dir / "task.json", task, sanitize=True)
-        task_output = task.get("output")
-        task_output = task_output if isinstance(task_output, dict) else {}
-        if str(task_output.get("task_status") or "").upper() != "SUCCEEDED":
-            raise YouTubeError(f"百炼转写失败；详见 {artifact_dir / 'task.json'}")
+        task_status = _task_status(task) or "UNKNOWN"
+        if task_status != "SUCCEEDED":
+            raise YouTubeError(f"百炼转写失败（状态：{task_status}）；详见 {artifact_dir / 'task.json'}")
         _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("task.json",))
 
         active_stage = "transcript_download"
-        _notify_stage(on_stage, active_stage, "running")
-        transcription_url, result_item = _first_successful_result(task)
-        transcription = _download_json(transcription_url)
-        write_json(artifact_dir / "transcription.json", transcription, sanitize=True)
-        if not transcript_has_content(transcription):
-            raise YouTubeError(
-                f"百炼任务完成但没有返回可读文字稿；详见 {artifact_dir / 'transcription.json'}"
+        if isinstance(transcription, dict) and transcript_has_content(transcription):
+            try:
+                _, result_item = _first_successful_result(task)
+            except YouTubeError:
+                result_item = {}
+            _notify_stage(
+                on_stage,
+                active_stage,
+                "succeeded",
+                artifact_paths=("transcription.json",),
+                reason="checkpoint_reused",
             )
-        _notify_stage(
-            on_stage,
-            active_stage,
-            "succeeded",
-            artifact_paths=("transcription.json",),
-        )
+        else:
+            _notify_stage(on_stage, active_stage, "running")
+            transcription_url, result_item = _first_successful_result(task)
+            transcription = _download_json(transcription_url)
+            write_json(artifact_dir / "transcription.json", transcription, sanitize=True)
+            if not transcript_has_content(transcription):
+                raise YouTubeError(
+                    f"百炼任务完成但没有返回可读文字稿；详见 {artifact_dir / 'transcription.json'}"
+                )
+            _notify_stage(
+                on_stage,
+                active_stage,
+                "succeeded",
+                artifact_paths=("transcription.json",),
+            )
 
         active_stage = "markdown_render"
         _notify_stage(on_stage, active_stage, "running")
-        transcript_path = artifact_dir / "transcript.md"
         write_transcript_markdown(transcript_path, transcription, model, task_id)
         _notify_stage(on_stage, active_stage, "succeeded", artifact_paths=("transcript.md",))
         active_stage = None
@@ -1913,22 +2274,28 @@ def transcribe_media(
                 "status": "completed",
                 "task_id": task_id,
                 "delivery": delivery,
-                "resolved_host": urlparse(signed_url).netloc,
-                "oss_object_key": oss_info["object_key"],
+                "attempt": attempt,
+                "resolved_host": urlparse(signed_url).netloc
+                if signed_url
+                else request_info.get("resolved_host"),
+                "oss_object_key": oss_info.get("object_key") or request_info.get("oss_object_key"),
                 "completed_at": utc_now(),
             }
         )
-        write_json(artifact_dir / "request-info.json", request_info)
+        write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
         return {
             "status": "completed",
             "model": model,
             "task_id": task_id,
             "delivery": delivery,
-            "resolved_host": urlparse(signed_url).netloc,
-            "oss_object_key": oss_info["object_key"],
+            "resolved_host": urlparse(signed_url).netloc
+            if signed_url
+            else str(request_info.get("resolved_host") or ""),
+            "oss_object_key": oss_info.get("object_key") or request_info.get("oss_object_key"),
             "transcript_path": str(transcript_path),
             "transcription": transcription,
             "result": sanitize_for_persist(result_item),
+            "resumed": reused_checkpoint_task,
         }
     except KeyboardInterrupt:
         message = "用户中断了视频转写。"
@@ -1958,7 +2325,7 @@ def transcribe_media(
                 "cancelled_at": utc_now(),
             }
         )
-        write_json(artifact_dir / "request-info.json", request_info)
+        write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
         raise
     except (OSError, subprocess.SubprocessError, YouTubeError, URLError) as exc:
         message = safe_error(str(exc), source_url, signed_url)
@@ -1988,7 +2355,7 @@ def transcribe_media(
                 "failed_at": utc_now(),
             }
         )
-        write_json(artifact_dir / "request-info.json", request_info)
+        write_json(artifact_dir / "request-info.json", request_info, sanitize=True)
         raise YouTubeError(message) from exc
 
 

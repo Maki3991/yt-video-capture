@@ -69,6 +69,15 @@ YouTube 的广告可能在几秒后出现“跳过广告”，也可能没有跳
 
 4. Inspect the generated `note.md`, `manifest.json`, `metadata.json`, and `video/`. A completed note must have `YOUTUBE_STATUS=captured`, a non-empty transcript, and a successful `manifest.json`. Browser-caption output must record `retrieval_method=computer_use` and `asr_status=skipped`; ASR output must record `media_delivery=oss-signed-url` and an `oss.json` artifact.
    `manifest.json` also records a `stages` object. Each stage is written back immediately and contains `status`, `started_at`, `completed_at`, `attempt`, `retryable`, `error`, `reason`, and `artifact_paths`; a failed or cancelled stage must remain visible even when a later fallback succeeds.
+   If a single ASR run is interrupted, resume only with an explicit existing output directory:
+
+   ```powershell
+   python "<skill-root>\scripts\youtube_video_to_md.py" `
+     "<youtube-video-url>" `
+     --resume-dir ".\youtube-video-results\<existing-single-run>"
+   ```
+
+   The resume path reads the saved `task_id`, polls the original task without re-uploading or re-submitting, and downloads and renders the result if it is complete. A terminally failed task is archived under `video/attempts/<NNN>/` before a new attempt is submitted. Do not combine `--resume-dir` with browser transcript or metadata-routing flags.
 5. Only after the single-video route is manually checked, process a small channel pilot first:
 
    ```powershell
@@ -169,6 +178,11 @@ video/
   submit.json
   task.json
   transcription.json
+  attempts/
+    <attempt>/
+      attempt.json
+      submit.json
+      task.json
 ```
 
 If a stage fails, `video/error.json` and a partial Markdown note are retained. A partial or failed note must not be described as a complete transcript.

@@ -145,6 +145,25 @@ python "<skill-root>\scripts\youtube_video_to_md.py" `
 
 使用 `--browser-no-transcript` 时，不提供 `--media-file`，脚本会先用 yt-dlp 下载音频到输出目录，再上传 OSS。OSS Bucket 保持私有，脚本只把短时签名 URL 交给百炼，不把签名 URL 写入 Markdown 或 JSON。`--media-file` 仅用于复用已有本地音频，跳过重复下载。
 
+### 中断后继续单个视频的 ASR
+
+如果 ASR 任务中途被关闭或按 `Ctrl+C` 中断，使用原来的输出目录显式恢复：
+
+```powershell
+python "<skill-root>\scripts\youtube_video_to_md.py" `
+  "https://www.youtube.com/watch?v=<video-id>" `
+  --resume-dir ".\youtube-video-results\<原来的结果目录>"
+```
+
+恢复时脚本会读取 `video/submit.json` 或 `video/request-info.json` 中的 `task_id`：
+
+- 任务仍在运行：继续轮询原任务，不重新上传 OSS，也不重新提交 ASR；
+- 任务已成功但结果还没落盘：重新获取结果并生成 Markdown；
+- 任务明确失败：把旧的 `submit.json`、`task.json` 和错误证据保存到 `video/attempts/001/`，再创建新的 attempt；
+- 没有有效的 `task_id`：只有在有本地音频时才创建新的 ASR 任务。
+
+`--resume-dir` 必须指向原结果目录，并且其中的 `manifest.json`、`metadata.json` 必须对应当前视频。不要把它和浏览器字幕分流参数一起使用。普通新运行仍使用 `--out-dir` 或自动生成新目录，不会自动猜测用户要恢复旧任务。
+
 ### 清空 OSS 内存
 
 “清空 OSS 内存”指清理本 Skill 上传的临时文件，不是删除整个 Bucket。OSS 的每个对象都有 `last_modified` 时间，脚本每次运行时用“当前 UTC 时间减去保留天数”计算截止时间，再找出更早的对象。
@@ -251,6 +270,7 @@ python "<skill-root>\scripts\youtube_channel_to_md.py" `
 - `--cookies <path>`：显式使用 Mozilla/Netscape 格式 Cookie 文件，作为 Chrome DPAPI 失败时的替代；不传时按固定目录自动查找（如果存在），且不与 `--cookies-from-browser` 同时使用。
 - `--diarization`：请求说话人分离；长视频先不要默认开启。
 - `--media-file <path>`：使用已有本地音频，跳过 yt-dlp 下载；单视频 ASR 始终上传 OSS。
+- `--resume-dir <path>`：显式恢复已有单视频目录中的 ASR 任务；复用原 `task_id`，避免重复提交。
 - `--oss-object-key <key>`：自定义 OSS 对象路径；默认是 `youtube-asr/<视频ID>.<扩展名>`。
 - `--oss-url-expires <seconds>`：OSS 签名 URL 有效期，默认 3600 秒。
 - `--channel-tab shorts`：批量采集 Shorts；默认只采集 `/videos`。

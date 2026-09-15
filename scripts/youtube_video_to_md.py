@@ -16,6 +16,7 @@ from youtube_asr import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     YouTubeError,
+    asr_checkpoint_state,
     artifact_path_for_output,
     build_transcript_contract,
     caption_result_for_persist,
@@ -51,6 +52,30 @@ def _default_output(source_url: str) -> Path:
 
 def _base_metadata(source_url: str) -> dict[str, Any]:
     return clean_video_metadata({}, source_url)
+
+
+def _load_resume_manifest(output: Path, source_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest_path = output / "manifest.json"
+    if not manifest_path.is_file():
+        raise YouTubeError(f"恢复目录缺少 manifest.json：{output}")
+    manifest = read_json(manifest_path)
+    saved_url = validate_video_url(str(manifest.get("source_url") or ""))
+    if saved_url != source_url:
+        raise YouTubeError("恢复目录中的 source_url 与当前 YouTube 链接不一致。")
+    metadata_path = output / "metadata.json"
+    if not metadata_path.is_file():
+        raise YouTubeError(f"恢复目录缺少 metadata.json：{output}")
+    metadata = read_json(metadata_path)
+    return manifest, metadata
+
+
+def _existing_audio_path(output: Path) -> Path | None:
+    candidates = [
+        path
+        for path in (output / "video").glob("source.*")
+        if path.is_file() and path.suffix.lower() not in {".json", ".md"}
+    ]
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
 
 
 def _record_stage(
@@ -132,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="输出目录；未指定时使用 ./youtube-video-results/<时间>-<视频标识>",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        type=Path,
+        default=None,
+        help="显式恢复已有单视频目录；会复用其中的 ASR task_id，不重新提交相同任务",
     )
     parser.add_argument(
         "--yt-dlp",
@@ -231,6 +262,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.out_dir is not None and args.resume_dir is not None:
+        parser.error("--out-dir 与 --resume-dir 只能二选一")
     if args.cookies_from_browser and args.cookies_file:
         parser.error("--cookies-from-browser 与 --cookies 只能二选一")
     if args.browser_transcript_file is not None and args.browser_no_transcript:
@@ -246,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.browser_no_transcript and args.metadata_file is not None:
         parser.error("--browser-no-transcript 不能与 --metadata-file 一起使用")
+    if args.resume_dir is not None and (
+        args.browser_transcript_file is not None
+        or args.browser_no_transcript
+        or args.metadata_file is not None
+    ):
+        parser.error("--resume-dir 不能与浏览器分流或 --metadata-file 一起使用")
     if (args.browser_title or args.browser_author) and not (
         args.browser_transcript_file or args.browser_no_transcript
     ):
@@ -260,31 +299,50 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[youtube-video] ERROR: {exc}", file=sys.stderr)
         return 2
 
-    output = (args.out_dir or _default_output(source_url)).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    resume_mode = args.resume_dir is not None
+    output = (args.resume_dir if resume_mode else (args.out_dir or _default_output(source_url)))
+    output = output.expanduser().resolve()
     note_path = output / "note.md"
     manifest_path = output / "manifest.json"
-    metadata = _base_metadata(source_url)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        **build_transcript_contract(
-            metadata,
-            scope="single",
-            status="running",
-            transcript_source=None,
-            asr_status="pending",
-        ),
-        "output_dir": str(output),
-        "note_path": str(note_path),
-        "stages": initial_stage_states(),
-    }
-    write_json(output / "metadata.json", metadata, sanitize=True)
-    write_json(manifest_path, manifest, sanitize=True)
-    caption_result: dict[str, Any] = {"status": "not_run"}
+    if resume_mode:
+        try:
+            manifest, metadata = _load_resume_manifest(output, source_url)
+        except (OSError, YouTubeError) as exc:
+            print(f"[youtube-video] ERROR: {exc}", file=sys.stderr)
+            return 2
+        manifest.setdefault("stages", initial_stage_states())
+        manifest["output_dir"] = str(output)
+        manifest["note_path"] = str(note_path)
+        manifest["status"] = "running"
+        manifest["updated_at"] = utc_now()
+        manifest["resume_count"] = int(manifest.get("resume_count") or 0) + 1
+        write_json(manifest_path, manifest, sanitize=True)
+        caption_result: dict[str, Any] = {"status": "not_run", "reason": "resume_existing_asr"}
+    else:
+        output.mkdir(parents=True, exist_ok=True)
+        metadata = _base_metadata(source_url)
+        manifest = {
+            "schema_version": 1,
+            **build_transcript_contract(
+                metadata,
+                scope="single",
+                status="running",
+                transcript_source=None,
+                asr_status="pending",
+            ),
+            "output_dir": str(output),
+            "note_path": str(note_path),
+            "stages": initial_stage_states(),
+        }
+        write_json(output / "metadata.json", metadata, sanitize=True)
+        write_json(manifest_path, manifest, sanitize=True)
+        caption_result = {"status": "not_run"}
     active_stage: str | None = None
 
     try:
-        if args.browser_transcript_file is not None:
+        if resume_mode:
+            print(f"[youtube-video] 显式恢复已有 ASR 任务：{output}", flush=True)
+        elif args.browser_transcript_file is not None:
             print("[youtube-video] importing Computer Use browser transcript...", flush=True)
             active_stage = "browser_transcript"
             _record_stage(
@@ -398,58 +456,60 @@ def main(argv: list[str] | None = None) -> int:
                 args.cookies_from_browser,
                 args.cookies_file,
             )
-        write_json(output / "metadata.json", metadata, sanitize=True)
-        _record_stage(
-            manifest,
-            manifest_path,
-            output,
-            source_url,
-            "metadata",
-            "succeeded",
-            artifact_paths=("metadata.json",),
-        )
-        if args.browser_transcript_file is not None:
+        if not resume_mode:
+            write_json(output / "metadata.json", metadata, sanitize=True)
             _record_stage(
                 manifest,
                 manifest_path,
                 output,
                 source_url,
-                "browser_transcript",
+                "metadata",
                 "succeeded",
-                artifact_paths=(
-                    f"video/{caption_result['raw_path']}",
-                    f"video/{caption_result['transcript_path']}",
-                    f"video/{caption_result['selection_path']}",
-                ),
-                artifact_root=output,
+                artifact_paths=("metadata.json",),
             )
+            if args.browser_transcript_file is not None:
+                _record_stage(
+                    manifest,
+                    manifest_path,
+                    output,
+                    source_url,
+                    "browser_transcript",
+                    "succeeded",
+                    artifact_paths=(
+                        f"video/{caption_result['raw_path']}",
+                        f"video/{caption_result['transcript_path']}",
+                        f"video/{caption_result['selection_path']}",
+                    ),
+                    artifact_root=output,
+                )
         active_stage = None
-        manifest.update(
-            {
-                "source_id": metadata.get("source_id"),
-                "title": metadata.get("title"),
-                "author": metadata.get("author"),
-                "published_at": metadata.get("published_at"),
-            }
-        )
-        write_json(manifest_path, manifest, sanitize=True)
+        if not resume_mode:
+            manifest.update(
+                {
+                    "source_id": metadata.get("source_id"),
+                    "title": metadata.get("title"),
+                    "author": metadata.get("author"),
+                    "published_at": metadata.get("published_at"),
+                }
+            )
+            write_json(manifest_path, manifest, sanitize=True)
 
-        if args.browser_transcript_file is not None:
-            manifest["captions"] = caption_result_for_persist(caption_result)
-        elif args.browser_no_transcript:
-            manifest["captions"] = {
-                "status": "not_available",
-                "retrieval_method": "computer_use",
-                "reason": "no_usable_transcript",
-            }
-        else:
-            manifest["captions"] = {
-                "status": "not_run",
-                "retrieval_method": "computer_use",
-                "reason": "browser_check_not_supplied",
-            }
-        write_json(manifest_path, manifest, sanitize=True)
-        if caption_result.get("status") == "succeeded":
+            if args.browser_transcript_file is not None:
+                manifest["captions"] = caption_result_for_persist(caption_result)
+            elif args.browser_no_transcript:
+                manifest["captions"] = {
+                    "status": "not_available",
+                    "retrieval_method": "computer_use",
+                    "reason": "no_usable_transcript",
+                }
+            else:
+                manifest["captions"] = {
+                    "status": "not_run",
+                    "retrieval_method": "computer_use",
+                    "reason": "browser_check_not_supplied",
+                }
+            write_json(manifest_path, manifest, sanitize=True)
+        if not resume_mode and caption_result.get("status") == "succeeded":
             caption_path = f"video/{caption_result['raw_path']}"
             active_stage = "markdown_render"
             _record_stage(
@@ -516,7 +576,14 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
-        media_path: Path
+        media_path: Path | None
+        checkpoint_state = asr_checkpoint_state(output / "video") if resume_mode else {}
+        existing_audio = _existing_audio_path(output) if resume_mode else None
+        resumable_task = bool(
+            checkpoint_state.get("task_id")
+            and str(checkpoint_state.get("task_status") or "").upper()
+            not in {"FAILED", "UNKNOWN"}
+        )
         if args.media_file is not None:
             media_path = args.media_file.expanduser().resolve()
             if not media_path.is_file():
@@ -542,6 +609,27 @@ def main(argv: list[str] | None = None) -> int:
                 reason="local_media_supplied",
             )
             print(f"[youtube-video] using local media: {media_path}", flush=True)
+        elif resume_mode and (resumable_task or existing_audio is not None):
+            media_path = existing_audio
+            _record_stage(
+                manifest,
+                manifest_path,
+                output,
+                source_url,
+                "media_download",
+                "skipped",
+                artifact_paths=(str(existing_audio),) if existing_audio else (),
+                reason=(
+                    "resuming_existing_task"
+                    if resumable_task
+                    else "reusing_existing_media"
+                ),
+                artifact_root=output,
+            )
+            if existing_audio:
+                print(f"[youtube-video] 复用已有本地音频：{existing_audio}", flush=True)
+            else:
+                print("[youtube-video] 已找到 ASR task_id；跳过音频重新下载。", flush=True)
         else:
             print("[youtube-video] downloading audio locally for OSS...", flush=True)
             active_stage = "media_download"
@@ -572,7 +660,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             active_stage = None
             print(f"[youtube-video] downloaded media: {media_path}", flush=True)
-        print("[youtube-video] uploading media to private OSS and submitting ASR...", flush=True)
+        if resumable_task:
+            print(
+                "[youtube-video] resuming the existing ASR task; skipping OSS upload and resubmission...",
+                flush=True,
+            )
+        else:
+            print("[youtube-video] uploading media to private OSS and submitting ASR...", flush=True)
         result = transcribe_media(
             source_url,
             output / "video",
@@ -589,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
             media_path=media_path,
             oss_object_key=args.oss_object_key,
             oss_url_expires=args.oss_url_expires,
+            resume=resume_mode,
             on_stage=_make_asr_stage_callback(
                 manifest,
                 manifest_path,
@@ -683,7 +778,7 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
 
-    if caption_result.get("status") in {"skipped", "failed"}:
+    if not resume_mode and caption_result.get("status") in {"skipped", "failed"}:
         caption_reason = caption_result.get("reason") or "caption_unavailable"
         error = f"字幕阶段 {caption_reason}；随后 ASR 阶段：{error}"
 

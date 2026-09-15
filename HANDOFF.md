@@ -1,6 +1,6 @@
 # YouTube 视频采集 Skill｜开发 Handoff
 
-> 日期：2026-09-14  
+> 日期：2026-09-15
 > 交给：负责继续开发 `yt-video-capture` 的 Agent  
 > 目标：完成“浏览器字幕优先、无字幕走本地音频→OSS→百炼、失败可解释、异步任务可续跑”的 YouTube 单视频基础，并为频道批量复用。
 
@@ -45,7 +45,7 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 - 当前频道批量已经有 `source/channel.json`、`source/videos.json`、`run.json`、逐项 `items/` 和 `notes/`，并能跳过已有成功项、使用 `--run-dir` 继续。
 - 当前单视频和频道批量条目已经共享 v1 输出契约：来源、范围、字幕字段、ASR 字段、处理状态和人工复核状态；字幕成功时 `transcript_source=platform_caption`、`asr_status=skipped`。
 - P0-2 阶段状态记录已接入：单视频 `manifest.json` 和频道 `run.json` 的每个 item 都持久化 `metadata`、`browser_transcript`、`media_download`、`oss_upload`、`asr_submit`、`asr_poll`、`transcript_download`、`markdown_render` 八个阶段，以及状态、时间、attempt、retryable、错误和产物路径；ASR 内部阶段在每次变化时立即写回。
-- 当前 ASR 已保存 `request-info.json`、`oss.json`、`submit.json`、`task.json`、`transcription.json`，但重新启动时还不会根据已有 `task_id` 继续轮询。
+- 当前 ASR 已保存 `request-info.json`、`oss.json`、`submit.json`、`task.json`、`transcription.json`；显式恢复时会根据已有 `task_id` 继续轮询，已完成本地结果会直接复用，明确失败的旧 attempt 会归档到 `video/attempts/<NNN>/`。
 - 当前共享 ASR 层只接受本地媒体文件，固定使用本地音频 → 私有 OSS → 百炼链路；`--via-oss` 和 YouTube CDN 直链路径已从单视频入口移除。
 - 当前实现使用 `--ignore-config`，不读取 Chrome 配置文件；如果 PATH 中有 Node.js，会自动追加 `--js-runtimes node` 处理 YouTube JavaScript challenge。yt-dlp 路线会自动检查外部固定目录 `D:\Softwares\Programming Projects\_yt-cookies\` 中的 Cookie 文件，显式 `--cookies <path>` 优先；`--cookies-from-browser` 与 `--cookies` 仍只能选一个，后者用于 Chrome DPAPI 无法解密时的 Mozilla/Netscape Cookie 文件。
 
@@ -125,11 +125,11 @@ artifact_paths: []
 - 不在错误中保存 Cookie、API Key、签名媒体 URL 或签名转写结果 URL；
 - 批量层继续维护成功、失败、跳过、不支持、待处理数量。
 
-实现状态：本轮已经把八个阶段写入单视频 `manifest.json` 和频道 `run.json` 的 item，并在阶段变化后立即持久化；频道 `run.json` 同步维护各状态计数。尚未完成的是“中断后恢复原 task_id”的 P1-1，以及 Gate C 对真实中断场景的验收。
+实现状态：本轮已经把八个阶段写入单视频 `manifest.json` 和频道 `run.json` 的 item，并在阶段变化后立即持久化；频道 `run.json` 同步维护各状态计数。P1-1 的代码已实现，包含单视频 `--resume-dir` 和频道 `--run-dir` 中对已有 ASR task 的复用；尚未完成的是 Gate C 对真实中断场景的验收。
 
 ### P1：P0 通过后、频道批量前完成
 
-#### P1-1｜ASR 任务支持续跑
+#### P1-1｜ASR 任务支持续跑（代码已实现，Gate C 待验收）
 
 这是五个点中的第二优先级。
 
@@ -154,7 +154,7 @@ artifact_paths: []
 - API Key 继续只从当前进程环境读取，不写入任何产物；
 - 原始转写 JSON 和规范化 Markdown 都要保留。
 
-建议沿用 `video/request-info.json`、`video/submit.json`、`video/task.json` 和 `video/transcription.json`，但让它们成为真正可恢复的 checkpoint，而不只是调试文件。
+实现沿用 `video/request-info.json`、`video/submit.json`、`video/task.json` 和 `video/transcription.json` 作为 checkpoint；被替换的失败 attempt 会保留在 `video/attempts/<NNN>/`，不再只是调试文件。
 
 OSS 投递链路已经作为单视频 ASR 的固定路径实现；本阶段不把 OSS 清理或媒体投递续跑与 ASR 任务续跑混在一起。OSS→百炼的真实端到端成功仍需单独验收，不能用模拟测试代替。
 
