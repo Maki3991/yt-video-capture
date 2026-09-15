@@ -36,6 +36,9 @@ DEFAULT_MODEL = "qwen-audio-3.0-asr-flash-filetrans"
 DEFAULT_API_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_TIMEOUT_SECONDS = 7200
+DEFAULT_COOKIE_DIR = Path(r"D:\Softwares\Programming Projects\_yt-cookies")
+DEFAULT_COOKIE_FILENAME = "youtube-cookies.txt"
+COOKIE_FILE_SUFFIXES = {".txt", ".cookie", ".cookies"}
 FINAL_STATUSES = {"SUCCEEDED", "FAILED", "UNKNOWN"}
 YOUTUBE_HOSTS = {
     "youtube.com",
@@ -254,6 +257,47 @@ def _find_yt_dlp(explicit: str | None) -> list[str]:
     )
 
 
+def _yt_dlp_js_runtime_args() -> list[str]:
+    """Enable yt-dlp's YouTube challenge solver when Node.js is available."""
+
+    if shutil.which("node"):
+        return ["--js-runtimes", "node"]
+    return []
+
+
+def _default_cookie_file() -> Path | None:
+    """Find the user's optional fixed Netscape-format Cookie file."""
+
+    configured_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    if configured_file:
+        cookie_path = Path(configured_file).expanduser().resolve()
+        if not cookie_path.is_file():
+            raise YouTubeError(f"Cookie 文件不存在：{cookie_path}")
+        return cookie_path
+
+    configured_dir = os.environ.get("YOUTUBE_COOKIES_DIR", "").strip()
+    cookie_dir = (
+        Path(configured_dir).expanduser().resolve()
+        if configured_dir
+        else DEFAULT_COOKIE_DIR
+    )
+    if not cookie_dir.is_dir():
+        return None
+
+    preferred = cookie_dir / DEFAULT_COOKIE_FILENAME
+    if preferred.is_file():
+        return preferred.resolve()
+
+    candidates = [
+        path
+        for path in cookie_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in COOKIE_FILE_SUFFIXES
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns).resolve()
+
+
 def _run_yt_dlp(
     args: list[str],
     explicit_yt_dlp: str | None = None,
@@ -262,7 +306,13 @@ def _run_yt_dlp(
 ) -> subprocess.CompletedProcess[str]:
     if cookies_from_browser and cookies_file:
         raise YouTubeError("--cookies-from-browser 与 --cookies 只能二选一")
-    command = [*_find_yt_dlp(explicit_yt_dlp), "--ignore-config"]
+    if not cookies_from_browser and cookies_file is None:
+        cookies_file = _default_cookie_file()
+    command = [
+        *_find_yt_dlp(explicit_yt_dlp),
+        "--ignore-config",
+        *_yt_dlp_js_runtime_args(),
+    ]
     if cookies_from_browser:
         command.extend(["--cookies-from-browser", cookies_from_browser])
     if cookies_file:

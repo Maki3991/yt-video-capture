@@ -13,12 +13,16 @@
 
 ## 一次性准备
 
-需要：Windows、Python 3 和 `yt-dlp`。有浏览器 Transcript 的视频只需要 Computer Use；没有 Transcript 时还需要百炼 API Key、`oss2` 和私有 OSS Bucket。默认不读取浏览器 Cookie。
+需要：Windows、Python 3、`yt-dlp`、Node.js 22+ 和官方 `yt-dlp-ejs`。有浏览器 Transcript 的视频只需要 Computer Use；没有 Transcript 时还需要百炼 API Key、`oss2` 和私有 OSS Bucket。脚本不读取 Chrome 配置文件，但会自动使用下方固定目录中的 Netscape/Mozilla Cookie 文件（如果存在）。
 
 ```powershell
 yt-dlp --version
+node --version
+python -m pip install -U yt-dlp-ejs
 $env:DASHSCOPE_API_KEY = "只在当前 PowerShell 会话中设置，不要写入文件"
 ```
+
+脚本会自动检查 PATH 中的 Node.js；找到后会自动让 `yt-dlp` 使用 Node 处理 YouTube 的 JavaScript challenge，不需要每次手动追加参数。`yt-dlp-ejs` 只需在当前 Python 环境安装一次。
 
 使用 OSS 路径时，将 `.env.example` 复制为 Skill 目录下的 `.env`，填写 RAM 子账号 `codex-youtube-asr` 的 `OSS_ACCESS_KEY_ID` 和 `OSS_ACCESS_KEY_SECRET`。`.env` 已被 Git 忽略，不要把密钥发到聊天或提交到仓库。
 
@@ -30,6 +34,18 @@ $env:YOUTUBE_YTDLP = "D:\path\to\yt-dlp.exe"
 
 也可以给命令加 `--yt-dlp "D:\path\to\yt-dlp.exe"`。脚本还会兼容已经用于小红书的 `XHS_YTDLP` 环境变量。
 
+### 固定 Cookie 文件位置
+
+默认目录是：
+
+```text
+D:\Softwares\Programming Projects\_yt-cookies\
+```
+
+请把浏览器扩展导出的 Netscape/Mozilla 格式 Cookie 文件放进这里。脚本优先使用 `youtube-cookies.txt`；如果没有这个文件，则使用该目录中最近修改的 `.txt`、`.cookie` 或 `.cookies` 文件。目录为空时，脚本不会读取任何 Cookie。也可以用 `YOUTUBE_COOKIES_DIR` 或 `YOUTUBE_COOKIES_FILE` 覆盖默认位置。
+
+这个目录在仓库外，Cookie 不会写入 Markdown、JSON 或 manifest；Cookie 仍属于高敏感凭据，不要上传、分享或提交。
+
 如果 YouTube 返回 “Sign in to confirm you’re not a bot”，可以在明确理解风险后，仅对当前运行显式加：
 
 ```powershell
@@ -38,7 +54,7 @@ $env:YOUTUBE_YTDLP = "D:\path\to\yt-dlp.exe"
 
 也可以指定 Chrome 配置文件，例如 `--cookies-from-browser "chrome:Default"`。脚本不会把 Cookie 保存到仓库或输出目录；不要把这个选项当成默认配置。yt-dlp 官方也提醒，使用账号批量请求可能触发限流或账号风险。
 
-如果 Windows Chrome 的 DPAPI 无法解密 Cookie，可改用 `--cookies "$env:TEMP\youtube-cookies.txt"` 传入你自己导出的 Mozilla/Netscape 格式 Cookie 文件。Cookie 文件高度敏感，应放在仓库外，任务完成后删除；脚本只在当前运行中把路径传给 yt-dlp，不会写入 Markdown、JSON 或 manifest。
+如果 Windows Chrome 的 DPAPI 无法解密 Cookie，固定目录中的导出文件会作为替代。也可以用 `--cookies <path>` 临时指定另一个 Mozilla/Netscape 格式 Cookie 文件；显式参数优先于固定目录中的自动选择。
 
 百炼默认使用：
 
@@ -50,7 +66,17 @@ qwen-audio-3.0-asr-flash-filetrans
 
 ### 当前登录 Chrome 的 Computer Use 路径
 
-在 Computer Use 中选择用户已经打开并登录的 Chrome YouTube 标签页，导航到视频链接。如果有广告，等待“跳过广告”按钮出现后点击，不要固定假设广告一定持续多少秒。然后调用该标签页的 YouTube transcript export 能力。它会返回一个 UTF-8 `.txt` 文件路径。把这个路径交给同一个单视频脚本：
+#### 广告门槛（必须完成后才能导出 Transcript）
+
+YouTube 广告可能在几秒后出现“跳过广告”，也可能没有按钮、连续播放多条广告，或直到倒计时结束。导航到视频后，禁止立即打开或导出 Transcript：
+
+1. 先等待至少 10 秒，每 2～3 秒观察一次播放器，最长等待 60 秒；10 秒只是最短观察时间。
+2. 出现“跳过广告”就点击，约 3 秒后再次检查；如果又出现广告，重复处理。
+3. 没有跳过按钮时，继续等待广告自然结束；不能因为没有按钮就提前导出。
+4. 确认广告遮罩、倒计时和按钮都消失，页面/主视频与目标链接一致，主视频画面和播放器已出现；清除广告后再等约 3 秒。
+5. 才能导出 Transcript。检查文字稿开头，若是广告或赞助商内容，丢弃并重新执行上述门槛，最多重试 2 次。60 秒仍无法确认主视频开始，则报告 `ad_not_cleared`，不要保存为成功文字稿。
+
+通过门槛后，调用该标签页的 YouTube transcript export 能力。它会返回一个 UTF-8 `.txt` 文件路径。把这个路径交给同一个单视频脚本：
 
 ~~~powershell
 python "<skill-root>\scripts\youtube_video_to_md.py" "<youtube-video-url>" --browser-transcript-file "<computer-use-exported-txt>" --browser-title "<visible-video-title>" --out-dir ".\youtube-video-results\browser-one-video"
@@ -210,7 +236,7 @@ python "<skill-root>\scripts\youtube_channel_to_md.py" `
 - --browser-author <author>：可选，补充浏览器页面可见的频道名。
 - `--language-hints zh,en`：已知视频语言时给百炼提示；不填则自动判断。
 - `--cookies-from-browser chrome`：明确允许 yt-dlp 读取浏览器登录态，用于 YouTube 的 bot/login challenge；默认关闭。
-- `--cookies <path>`：显式使用 Mozilla/Netscape 格式 Cookie 文件，作为 Chrome DPAPI 失败时的替代；默认关闭，且不与 `--cookies-from-browser` 同时使用。
+- `--cookies <path>`：显式使用 Mozilla/Netscape 格式 Cookie 文件，作为 Chrome DPAPI 失败时的替代；不传时按固定目录自动查找（如果存在），且不与 `--cookies-from-browser` 同时使用。
 - `--diarization`：请求说话人分离；长视频先不要默认开启。
 - `--media-file <path>`：使用已有本地音频，跳过 yt-dlp 下载；单视频 ASR 始终上传 OSS。
 - `--oss-object-key <key>`：自定义 OSS 对象路径；默认是 `youtube-asr/<视频ID>.<扩展名>`。
@@ -222,10 +248,10 @@ python "<skill-root>\scripts\youtube_channel_to_md.py" `
 ## 当前限制
 
 - 浏览器字幕路线依赖当前 Computer Use 能控制用户已经登录的 Chrome 标签页；普通 Python 进程不会自动继承浏览器登录态。
-- 无 Transcript 路线仍需要 yt-dlp 成功下载本地音频；如果 YouTube 对 yt-dlp 返回登录/反爬挑战，下载阶段仍会失败，需要用户明确提供可用的 Cookie 方案或本地音频。
+- 无 Transcript 路线仍需要 Node.js、`yt-dlp-ejs` 和 yt-dlp 成功下载本地音频；如果 YouTube 仍返回登录/反爬挑战，需要刷新固定目录中的 Cookie 文件、显式提供其他 Cookie 文件，或改用已有本地音频。
 - OSS 路径需要有效的 RAM AccessKey、`oss2` 和 Bucket Policy；上传失败或签名 URL 失效时同样只记录失败证据。
 - YouTube 对自动化请求会持续调整反爬、PO Token 和登录要求；“给任意视频链接都成功”不是当前可承诺的能力。先用一个真实链接验收，再扩大批量。
-- 不读取浏览器 Cookie，不绕过登录、年龄限制、验证码、地区限制或付费访问。
+- 不读取 Chrome 浏览器配置数据库；只使用用户预先导出的外部 Cookie 文件，不绕过登录、年龄限制、验证码、地区限制或付费访问。
 - “前 N 条”是本次 `yt-dlp` 看到的公开频道标签顺序，不代表频道所有历史视频，也不包括不可访问条目。
 - 批量任务按顺序处理，50 条视频可能需要较长时间并产生相应 ASR 费用；先验证单条和 5 条小批次。
 - 文字稿可能来自 YouTube 字幕或 ASR；两者都应抽查原视频，采集成功不等于内容事实已经核验。

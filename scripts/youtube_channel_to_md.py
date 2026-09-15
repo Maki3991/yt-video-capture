@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="PATH",
-        help="使用 Mozilla/Netscape 格式的 Cookie 文件；不要放入仓库",
+        help="使用 Mozilla/Netscape 格式的 Cookie 文件；不指定时自动检查固定 Cookie 目录；不要放入仓库",
     )
     parser.add_argument(
         "--api-base-url",

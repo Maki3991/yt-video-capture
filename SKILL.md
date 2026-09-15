@@ -27,15 +27,25 @@ The Python single-video script does not read YouTube captions with yt-dlp and do
 
 The browser route is read-only: it uses the user's authorized Chrome page only to obtain the visible YouTube Transcript and click a visible ad-skip control. It does not read or export Cookie, submit data to YouTube, or bypass login, CAPTCHA, age gates, or access controls. Channel batches remain yt-dlp-based for now; their ASR fallback also uses local audio→OSS→Bailian.
 
+## Computer Use 广告门槛（必须完成）
+
+YouTube 的广告可能在几秒后出现“跳过广告”，也可能没有跳过按钮、连续播放多条广告，或直到倒计时结束才进入主视频。对每个单视频浏览器任务，必须先完成下面的门槛；在门槛通过前，禁止打开或导出 Transcript：
+
+1. 导航到目标 `/watch` 页面后，先等待至少 10 秒；每 2～3 秒观察一次播放器状态，最长等待 60 秒。10 秒只是最短观察时间，不代表广告已经结束。
+2. 如果出现可见的“跳过广告”按钮，立即点击；等待约 3 秒后再次观察。如果又出现第二条广告，重复点击和观察。
+3. 如果始终没有跳过按钮，继续等待广告自然结束。没有按钮不是可以提前导出 Transcript 的理由。
+4. 只有同时确认广告遮罩、广告倒计时和“跳过广告”控件都消失，页面仍是用户给定的视频，且主视频画面/播放器已经出现（正在播放时确认时间轴在推进）后，才算广告清除；清除后再等待约 3 秒。
+5. 现在才调用 Transcript 导出。检查导出文本开头：如果明显是广告、赞助商或与目标视频无关的内容，丢弃这次导出，重新执行本门槛，最多重试 2 次。60 秒后仍无法确认主视频开始时，记录 `ad_not_cleared` 并停止，不得把广告字幕保存为成功文字稿。
+
 ## Workflow
 
-1. One-time setup: ensure Python 3 and `yt-dlp` are available. A video with a usable browser Transcript does not need `DASHSCOPE_API_KEY`, `oss2`, or OSS credentials. The no-Transcript route needs `DASHSCOPE_API_KEY`, `oss2`, and the ignored Skill-local `.env` with the RAM credentials and private Bucket settings. Do not write secrets into Markdown or JSON artifacts. The default route does not read browser cookies.
+1. One-time setup: ensure Python 3, `yt-dlp`, Node.js 22+, and the official `yt-dlp-ejs` package are available. The shared yt-dlp helper automatically adds `--js-runtimes node` when Node.js is found on PATH. It does not read the Chrome profile directly; when present, it automatically uses the newest Netscape/Mozilla Cookie file in `D:\Softwares\Programming Projects\_yt-cookies\` (prefer the stable name `youtube-cookies.txt`). A video with a usable browser Transcript does not need `DASHSCOPE_API_KEY`, `oss2`, or OSS credentials. The no-Transcript route needs `DASHSCOPE_API_KEY`, `oss2`, and the ignored Skill-local `.env` with the RAM credentials and private Bucket settings. Do not write secrets into Markdown or JSON artifacts.
 2. For one video, use the authorized Computer Use browser route as the first branch:
 
    - select the user's already-open YouTube Chrome tab;
    - navigate to the user-provided /watch URL if needed;
-   - if an ad is playing, wait for the visible skip control and click it; do not assume a fixed ad duration;
-   - call the browser tab's transcript export capability;
+   - complete the mandatory **Computer Use 广告门槛** above before any Transcript action;
+   - only after the gate passes, call the browser tab's transcript export capability;
    - if export succeeds, capture the returned UTF-8 text file path and visible page title, then run the local importer:
 
    ~~~powershell
@@ -67,7 +77,7 @@ The browser route is read-only: it uses the user's authorized Chrome page only t
      --run-name "channel-pilot"
    ```
 
-   If YouTube returns a bot/login challenge, explicitly opt in to browser-cookie access for that run, for example `--cookies-from-browser chrome` or `--cookies-from-browser "chrome:Default"`. This is a sensitive choice and is never enabled implicitly.
+   If YouTube returns a bot/login challenge and the fixed Cookie directory is empty or its file has expired, refresh the exported Cookie file there. As a one-run alternative, explicitly opt in to browser-cookie access with `--cookies-from-browser chrome` or pass `--cookies <path>`. Browser-profile access is never enabled implicitly.
 
 6. For the requested first N videos, replace `--limit 5` with the user-specified N. The default tab is `/videos`; use `--channel-tab shorts` or `--channel-tab streams` only when explicitly requested. The batch is sequential by default, records each item's status, and can resume with `--run-dir <existing-run-dir>`.
 7. Treat `notes/` as the user-facing output. Treat `run.json`, `source/`, and `items/` as provenance and recovery evidence.
@@ -176,8 +186,8 @@ The batch's “first N” means the order returned by yt-dlp for the public chan
 - For a single video, yt-dlp is used only to download a local audio file after Computer Use confirms that no usable Transcript exists. It is never used to extract the single video's captions or to resolve a YouTube CDN URL for Bailian.
 - The ASR route always uploads the local media file to the private OSS Bucket and gives Bailian a short-lived signed GET URL. The signed URL is never persisted.
 - `qwen-audio-3.0-asr-flash-filetrans` accepts one publicly reachable media URL per task and supports long media within the service's documented limits. The result URL is temporary and is downloaded immediately into `video/transcription.json`.
-- By default the Skill does not read browser cookies. If the user explicitly supplies `--cookies-from-browser`, yt-dlp reads that browser profile for the current run only; the Skill never saves the cookies. This may expose the account to YouTube rate limits or account risk, so use it only when necessary. The Skill still does not bypass login, CAPTCHA, age gates, or access controls. Private, members-only, region-blocked, age-restricted, live, or deleted videos may fail.
-- If Chrome's Windows DPAPI prevents `--cookies-from-browser chrome`, explicitly pass a Mozilla/Netscape-format cookie file with `--cookies <path>` instead. Export it yourself only when you understand that it is highly sensitive; keep it outside the repository and delete it when the run is finished. The Skill passes the path to yt-dlp for the current run and never persists it.
+- By default the Skill does not read the Chrome browser profile. For yt-dlp routes, if the fixed external Cookie directory contains a supported file, the helper passes that file automatically; explicit `--cookies <path>` overrides it. The Skill never writes Cookie contents to artifacts. Cookie use may expose the account to YouTube rate limits or account risk, so use it only when necessary. The Skill still does not bypass login, CAPTCHA, age gates, or access controls. Private, members-only, region-blocked, age-restricted, live, or deleted videos may fail.
+- If Chrome's Windows DPAPI prevents `--cookies-from-browser chrome`, keep using the exported Mozilla/Netscape-format file in the fixed external directory, or explicitly pass another path with `--cookies <path>`. Refresh the file only when yt-dlp reports that the login/session is no longer accepted.
 - A batch completing means the pipeline finished its per-item work. It does not mean the transcript is factually correct; manually sample notes before using them as research material.
 - Channel batches are intentionally sequential. This limits accidental API bursts and makes partial recovery understandable. Do not start a second batch for the same channel while one is running.
 - Never persist `DASHSCOPE_API_KEY`, raw signed media URLs, or raw signed transcription-result URLs.

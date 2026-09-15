@@ -25,7 +25,7 @@
 
 ```text
 YouTube URL + 当前 Codex 可控制的登录 Chrome
-  → Computer Use 等待并跳过可见广告
+  → Computer Use 完成广告清除门槛并确认主视频开始
   → 有可用 Transcript：导出页面文字稿并生成 Markdown
   → 无可用 Transcript：yt-dlp 下载本地音频
   → 私有 OSS 短时签名 URL
@@ -46,7 +46,7 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 - 当前单视频和频道批量条目已经共享 v1 输出契约：来源、范围、字幕字段、ASR 字段、处理状态和人工复核状态；字幕成功时 `transcript_source=platform_caption`、`asr_status=skipped`。
 - 当前 ASR 已保存 `request-info.json`、`oss.json`、`submit.json`、`task.json`、`transcription.json`，但重新启动时还不会根据已有 `task_id` 继续轮询。
 - 当前共享 ASR 层只接受本地媒体文件，固定使用本地音频 → 私有 OSS → 百炼链路；`--via-oss` 和 YouTube CDN 直链路径已从单视频入口移除。
-- 当前实现使用 `--ignore-config`，默认不读 Cookie；用户可显式提供 `--cookies-from-browser` 或 `--cookies <path>`，二者只能选一个，后者用于 Chrome DPAPI 无法解密时的 Mozilla/Netscape Cookie 文件。
+- 当前实现使用 `--ignore-config`，不读取 Chrome 配置文件；如果 PATH 中有 Node.js，会自动追加 `--js-runtimes node` 处理 YouTube JavaScript challenge。yt-dlp 路线会自动检查外部固定目录 `D:\Softwares\Programming Projects\_yt-cookies\` 中的 Cookie 文件，显式 `--cookies <path>` 优先；`--cookies-from-browser` 与 `--cookies` 仍只能选一个，后者用于 Chrome DPAPI 无法解密时的 Mozilla/Netscape Cookie 文件。
 
 ## 2. 总优先级
 
@@ -60,7 +60,9 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 
 ```text
 打开用户已登录的 Chrome
-  → 等待并点击可见的“跳过广告”按钮
+  → 广告门槛：至少观察 10 秒，每 2～3 秒检查，最长 60 秒
+  → 有“跳过广告”就点击；没有按钮就等待自然结束
+  → 确认广告控件消失、主视频画面出现，再等待约 3 秒
   → 尝试导出 YouTube Transcript
   → 导出成功：浏览器导入器生成 Markdown，并跳过 ASR
   → 没有 Transcript：传入 --browser-no-transcript
@@ -72,6 +74,9 @@ YouTube URL + 当前 Codex 可控制的登录 Chrome
 
 约束：
 
+- Transcript 导出前必须通过广告门槛；不能因为 Transcript 面板可打开就跳过广告检查；
+- 导出后检查文字稿开头，疑似广告时丢弃并重做门槛，最多重试 2 次；
+- 60 秒仍无法确认主视频开始时记录 `ad_not_cleared`，不得把广告字幕标记为成功；
 - Python 单视频脚本不调用 yt-dlp 字幕能力；
 - Python 单视频脚本不把 YouTube CDN 直链交给百炼；
 - `--browser-transcript-file` 表示字幕已由 Computer Use 导出；
@@ -267,6 +272,7 @@ review_status: unreviewed | sampled | needs_review
 
 浏览器路线的额外验收要求：
 
+- 广告门槛通过后才导出 Transcript，并能确认导出开头不是广告内容；
 - Computer Use 从用户已登录的 Chrome 页面导出 UTF-8 文字稿；
 - 浏览器导出的原始文本保存到 video/captions/；
 - captions 中记录 retrieval_method=computer_use；
@@ -324,7 +330,7 @@ Gate A-C 通过后，再运行频道 5 条小批量：
 - 不把“有字幕”推断成字幕一定完整可用；
 - 不把 ASR 文字稿当作事实核验结果；
 - 无 Transcript 时只下载音频到本地用于 OSS 投递；不默认保存完整视频；
-- 不读取、保存或输出 Cookie、API Key、签名媒体 URL；
+- 不读取 Chrome 配置数据库；仅按固定目录或显式路径读取已导出的 Cookie 文件，不保存或输出 Cookie 内容、API Key 或签名媒体 URL；
 - 不为补足频道数量而搜索新视频；
 - 不在本次任务中开发跨平台总控；
 - 每完成一个 Gate，都更新 `README.md`/项目导航中的状态、证据等级、已知失败和下一闸门，但不要修改与本次 YouTube 任务无关的文件。

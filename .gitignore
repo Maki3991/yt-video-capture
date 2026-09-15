@@ -5,6 +5,7 @@
 # Local runtime output and caches.
 __pycache__/
 *.py[cod]
+tmp/
 
 # Generated OSS-route test artifacts may contain transcript content.
 oss-test-results/
